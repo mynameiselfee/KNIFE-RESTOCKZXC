@@ -96,24 +96,26 @@ def send_text(text, markup=None):
     return tg("sendMessage", params)
 
 
-def alert_caption(it):
+def alert_caption(it, test=False):
     shape = f"\U0001F6F9 <b>{esc(it['shape'])}</b>"
     if it.get("size"):
         shape += f" \u00B7 {esc(it['size'])}"
+    head = "\U0001F9EA <b>TEST ALERT</b>" if test else "\U0001F7E2 <b>DECK IN STOCK</b>"
     lines = [
-        "\U0001F7E2 <b>DECK IN STOCK</b>",
+        head,
         LINE,
         f"<b>{esc(it['name'])}</b>",
         shape,
     ]
     if it.get("price"):
         lines.append(f"\U0001F4B5 {esc(it['price'])}")
-    lines += [LINE, "\u26A1 <i>Drops go fast. Tap Add to cart.</i>"]
+    foot = "This is a sample. Nothing just restocked." if test else "Drops go fast. Tap Add to cart."
+    lines += [LINE, f"\u26A1 <i>{foot}</i>"]
     return "\n".join(lines)
 
 
-def send_alert(it):
-    caption = alert_caption(it)
+def send_alert(it, test=False):
+    caption = alert_caption(it, test)
     markup = buttons(
         ("\U0001F6D2 Add to cart", it["cart"]), ("\U0001F517 Open page", it["url"])
     )
@@ -143,6 +145,14 @@ def send_alerts(items):
         send_text("\n".join(lines), buttons(("\U0001F6D2 Open shop", SITE)))
 
 
+def send_test(snap):
+    items = [v for v in snap.values() if v["available"]] or list(snap.values())
+    if not items:
+        send_text("No KH1, KL2 or KL1 decks found in the store feed right now.")
+        return
+    send_alert(items[0], test=True)
+
+
 def status_text(snap):
     lines = ["\U0001F4E1 <b>Knife MFG \u00B7 deck radar</b>", LINE]
     for sh in SHAPES:
@@ -161,6 +171,7 @@ HELP = (
     "\U0001F6F9 <b>Knife MFG restock bot</b>\n" + LINE + "\n"
     "I watch KH1, KL2 and KL1 decks and ping you the moment one is back.\n\n"
     "/status \u2013 what's in stock right now\n"
+    "/test \u2013 send a sample alert\n"
     "/help \u2013 this message"
 )
 
@@ -176,6 +187,8 @@ def handle_commands(state, snap):
         cmd = parts[0].split("@")[0].lower() if parts else ""
         if cmd in ("/status", "/now", "/stock"):
             send_text(status_text(snap), buttons(("\U0001F6D2 Open shop", SITE)))
+        elif cmd == "/test":
+            send_test(snap)
         elif cmd in ("/start", "/help"):
             send_text(HELP)
 
@@ -219,6 +232,7 @@ if __name__ == "__main__":
     try:
         tg("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "What's in stock right now"},
+            {"command": "test", "description": "Send a sample alert"},
             {"command": "help", "description": "About this bot"},
         ])})
     except Exception as e:
