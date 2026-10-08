@@ -19,6 +19,7 @@ SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "5")))
 STARTUP_PING = os.getenv("STARTUP_PING", "1") == "1"
+LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))  # 1 = log every check, 60 = about every 5 min
 OFFLINE_AFTER = 6            # failed checks in a row before a warning
 MAX_ALERTS_PER_DROP = 4      # photo alerts per check, the rest go in one list
 
@@ -558,7 +559,9 @@ _quiet_checks = 0
 def check_stock():
     global CURRENT_SNAPSHOT, LAST_CHECK, _last_available, _quiet_checks
 
+    started = time.time()
     snapshot = build_snapshot(fetch_products())
+    took = time.time() - started
     if not snapshot:
         raise FetchError("no tracked shapes in the feed")
 
@@ -590,10 +593,10 @@ def check_stock():
         remember_drop(alerts)
         send_alerts(alerts)
 
-    # quiet logging: only when something changes, or every ~5 minutes
+    # quiet by default: only when something changes, or every LOG_EVERY checks
     _quiet_checks += 1
-    if available != _last_available or _quiet_checks >= 60:
-        log(f"{len(snapshot)} variants | {available} in stock")
+    if available != _last_available or _quiet_checks >= LOG_EVERY:
+        log(f"{len(snapshot)} variants | {available} in stock | {took:.1f}s")
         _last_available = available
         _quiet_checks = 0
 
