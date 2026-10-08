@@ -5,12 +5,10 @@ import html
 import threading
 import urllib.parse
 import urllib.request
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 SITE = "https://knifemfg.co"
@@ -41,18 +39,17 @@ TELEGRAM_CHAT_ID = os.getenv(
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 "
-        "(compatible; Knife-MFG-Deck-Radar/1.0)"
+        "(compatible; KnifeMFG-DeckRadar/1.0)"
     ),
     "Accept": "application/json,text/plain,*/*",
 }
 
 
 # ============================================================
-# GLOBAL DATA
+# GLOBAL STATE
 # ============================================================
 
 CURRENT_SNAPSHOT = {}
-
 STATE = {}
 
 LOCK = threading.Lock()
@@ -80,7 +77,7 @@ def escape(text):
 
 
 # ============================================================
-# HTTP
+# FETCH URL
 # ============================================================
 
 def fetch_url(url, timeout=20):
@@ -105,7 +102,6 @@ def fetch_url(url, timeout=20):
 def fetch_products():
 
     all_products = []
-
     page = 1
 
     while True:
@@ -161,7 +157,7 @@ def fetch_products():
 
 
 # ============================================================
-# FIND KH1 / KL2 / KL1
+# DETECT SHAPE
 # ============================================================
 
 def extract_shape(title):
@@ -336,8 +332,7 @@ def telegram_api(
             if not result.get("ok"):
 
                 log(
-                    f"Telegram error: "
-                    f"{result}"
+                    f"Telegram error: {result}"
                 )
 
             return result
@@ -355,7 +350,7 @@ def telegram_api(
 
 
 # ============================================================
-# SEND TELEGRAM TEXT
+# SEND TELEGRAM MESSAGE
 # ============================================================
 
 def send_text(text):
@@ -372,7 +367,7 @@ def send_text(text):
 
 
 # ============================================================
-# SEND TELEGRAM PHOTO
+# SEND PHOTO
 # ============================================================
 
 def send_photo(
@@ -401,7 +396,7 @@ def send_photo(
 
 
 # ============================================================
-# BUTTONS
+# TELEGRAM BUTTONS
 # ============================================================
 
 def buttons(
@@ -426,144 +421,117 @@ def buttons(
 
 
 # ============================================================
-# STATUS MESSAGE
+# /STATUS
 #
-# Designed to look like your screenshot:
+# EXACT FORMAT REQUESTED
 #
-# 🛰️ Knife MFG · deck radar
-#
-# ━━━━━━━━━━━━━━━━━━━━
-#
+# 📡 Knife MFG · deck radar
+# ━━━━━━━━━━━━━━
 # ⚫ KH1 · sold out
 # ⚫ KL2 · sold out
 # ⚫ KL1 · sold out
-#
-# ━━━━━━━━━━━━━━━━━━━━
-#
-# 🕐 checked just now       20:41
+# ━━━━━━━━━━━━━━
+# 🕒 checked just now
 # ============================================================
 
 def status_text():
 
     with LOCK:
-
         snapshot = dict(
             CURRENT_SNAPSHOT
         )
 
-    # Singapore time
-    now = datetime.now(
-        ZoneInfo("Asia/Singapore")
-    )
-
-    current_time = now.strftime(
-        "%H:%M"
-    )
-
     def is_in_stock(shape):
 
-        for item in snapshot.values():
+        return any(
+            item.get("shape") == shape
+            and item.get("available", False)
+            for item in snapshot.values()
+        )
 
-            if (
-                item.get("shape") == shape
-                and item.get("available", False)
-            ):
-
-                return True
-
-        return False
-
-    kh1 = is_in_stock("KH1")
-    kl2 = is_in_stock("KL2")
-    kl1 = is_in_stock("KL1")
-
-    kh1_status = (
-        "in stock"
-        if kh1
-        else "sold out"
-    )
-
-    kl2_status = (
-        "in stock"
-        if kl2
-        else "sold out"
-    )
-
-    kl1_status = (
-        "in stock"
-        if kl1
-        else "sold out"
-    )
+    kh1_stock = is_in_stock("KH1")
+    kl2_stock = is_in_stock("KL2")
+    kl1_stock = is_in_stock("KL1")
 
     kh1_icon = (
         "🟢"
-        if kh1
+        if kh1_stock
         else "⚫"
     )
 
     kl2_icon = (
         "🟢"
-        if kl2
+        if kl2_stock
         else "⚫"
     )
 
     kl1_icon = (
         "🟢"
-        if kl1
+        if kl1_stock
         else "⚫"
     )
 
+    kh1_status = (
+        "in stock"
+        if kh1_stock
+        else "sold out"
+    )
+
+    kl2_status = (
+        "in stock"
+        if kl2_stock
+        else "sold out"
+    )
+
+    kl1_status = (
+        "in stock"
+        if kl1_stock
+        else "sold out"
+    )
+
     return (
-        "🛰️ <b>Knife MFG · deck radar</b>\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        f"{kh1_icon} <b>KH1</b> · {kh1_status}\n"
-        f"{kl2_icon} <b>KL2</b> · {kl2_status}\n"
-        f"{kl1_icon} <b>KL1</b> · {kl1_status}\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        f"🕐 checked just now     "
-        f"<code>{current_time}</code>"
+        "📡 <b>Knife MFG · deck radar</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{kh1_icon} KH1 · {kh1_status}\n"
+        f"{kl2_icon} KL2 · {kl2_status}\n"
+        f"{kl1_icon} KL1 · {kl1_status}\n"
+        "━━━━━━━━━━━━━━\n"
+        "🕒 checked just now"
     )
 
 
 # ============================================================
-# HELP MESSAGE
+# /HELP
 # ============================================================
 
-HELP = """
-🛰️ <b>Knife MFG · deck radar</b>
-
-━━━━━━━━━━━━━━━━━━━━
-
-🚨 <b>DROP WATCH ACTIVE</b>
-
-I'm watching Knife MFG 24/7.
-
-🎯 KH1
-🎯 KL2
-🎯 KL1
-
-Stock detected?
-<b>You'll know immediately.</b> ⚡
-
-━━━━━━━━━━━━━━━━━━━━
-
-<b>COMMANDS</b>
-
-/status — Check current stock
-/stock — Check current stock
-/now — Check current stock
-/help — Show commands
-
-━━━━━━━━━━━━━━━━━━━━
-
-🟢 SYSTEM ONLINE
-⚡ RADAR ACTIVE
-🚨 DROP ALERTS ON
-""".strip()
+HELP = (
+    "📡 <b>Knife MFG · deck radar</b>\n"
+    "━━━━━━━━━━━━━━\n"
+    "\n"
+    "🚨 <b>DROP WATCH ACTIVE</b>\n"
+    "\n"
+    "I'm watching Knife MFG 24/7.\n"
+    "\n"
+    "🎯 KH1\n"
+    "🎯 KL2\n"
+    "🎯 KL1\n"
+    "\n"
+    "Stock detected?\n"
+    "<b>You'll know immediately.</b> ⚡\n"
+    "\n"
+    "━━━━━━━━━━━━━━\n"
+    "\n"
+    "<b>COMMANDS</b>\n"
+    "\n"
+    "/status — Check current stock\n"
+    "/help — Show commands\n"
+    "\n"
+    "━━━━━━━━━━━━━━\n"
+    "\n"
+    "🟢 SYSTEM ONLINE\n"
+    "⚡ RADAR ACTIVE\n"
+    "🚨 DROP ALERTS ON"
+)
 
 
 # ============================================================
@@ -612,7 +580,7 @@ def send_alert(item):
         "image"
     )
 
-    # Try image alert first
+    # Try sending an image first
 
     if image:
 
@@ -634,8 +602,8 @@ def send_alert(item):
     send_text(
         caption
         + "\n\n"
-        + f'🛒 <a href="{escape(cart_url)}">'
-        "BUY NOW"
+        + f'<a href="{escape(cart_url)}">'
+        "🛒 BUY NOW"
         "</a>"
     )
 
@@ -774,9 +742,8 @@ def check_stock():
                 STATE
             )
 
-            # ------------------------------------------------
-            # FIRST RUN
-            # ------------------------------------------------
+            # First run:
+            # establish baseline without sending alerts.
 
             if not previous_state:
 
@@ -794,15 +761,13 @@ def check_stock():
                 save_state()
 
                 log(
-                    "Initial stock baseline "
-                    f"created: {len(snapshot)} variants"
+                    "Initial baseline created: "
+                    f"{len(snapshot)} variants"
                 )
 
                 return
 
-            # ------------------------------------------------
-            # RESTOCK DETECTION
-            # ------------------------------------------------
+            # Detect sold out -> in stock
 
             for key, item in snapshot.items():
 
@@ -820,7 +785,6 @@ def check_stock():
                     )
                 )
 
-                # Sold out → available
                 if (
                     now_available
                     and not was_available
@@ -838,8 +802,8 @@ def check_stock():
 
             save_state()
 
-        # Send alerts OUTSIDE the lock.
-        # This keeps /status fast.
+        # Send alerts outside lock.
+        # This keeps /status responsive.
 
         for item in alerts:
 
@@ -850,7 +814,10 @@ def check_stock():
         available_count = sum(
             1
             for item in snapshot.values()
-            if item.get("available", False)
+            if item.get(
+                "available",
+                False
+            )
         )
 
         log(
@@ -868,9 +835,6 @@ def check_stock():
 
 # ============================================================
 # TELEGRAM LISTENER
-#
-# Long polling means /status does NOT have to wait
-# for the 5-second stock checking loop.
 # ============================================================
 
 def telegram_listener():
@@ -937,7 +901,8 @@ def telegram_listener():
                     )
                 )
 
-                # ONLY YOUR TELEGRAM CHAT
+                # Only allow your own chat
+
                 if (
                     str(TELEGRAM_CHAT_ID)
                     != chat_id
@@ -966,45 +931,10 @@ def telegram_listener():
                 )
 
                 # --------------------------------------------
-                # /START
-                # --------------------------------------------
-
-                if command == "/start":
-
-                    send_text(
-                        "🛰️ <b>Knife MFG · deck radar</b>\n"
-                        "\n"
-                        "🟢 Radar is online.\n"
-                        "⚡ Restock monitoring is active.\n"
-                        "\n"
-                        "Use /status to check stock."
-                    )
-
-                # --------------------------------------------
                 # /STATUS
                 # --------------------------------------------
 
-                elif command == "/status":
-
-                    send_text(
-                        status_text()
-                    )
-
-                # --------------------------------------------
-                # /STOCK
-                # --------------------------------------------
-
-                elif command == "/stock":
-
-                    send_text(
-                        status_text()
-                    )
-
-                # --------------------------------------------
-                # /NOW
-                # --------------------------------------------
-
-                elif command == "/now":
+                if command == "/status":
 
                     send_text(
                         status_text()
@@ -1021,13 +951,28 @@ def telegram_listener():
                     )
 
                 # --------------------------------------------
-                # UNKNOWN
+                # /START
+                # --------------------------------------------
+
+                elif command == "/start":
+
+                    send_text(
+                        "📡 <b>Knife MFG · deck radar</b>\n"
+                        "\n"
+                        "🟢 Radar is online.\n"
+                        "⚡ Restock monitoring is active.\n"
+                        "\n"
+                        "Use /status to check stock."
+                    )
+
+                # --------------------------------------------
+                # UNKNOWN COMMAND
                 # --------------------------------------------
 
                 else:
 
                     send_text(
-                        "❓ <b>Unknown command.</b>\n\n"
+                        "❓ Unknown command.\n\n"
                         "Use /help."
                     )
 
@@ -1050,7 +995,7 @@ def setup_telegram():
         "Checking Telegram connection..."
     )
 
-    # Check bot
+    # Verify bot
 
     result = telegram_api(
         "getMe"
@@ -1069,7 +1014,7 @@ def setup_telegram():
         f"@{bot.get('username')}"
     )
 
-    # Remove webhook so getUpdates works
+    # Remove webhook so long polling works
 
     telegram_api(
         "deleteWebhook",
@@ -1079,21 +1024,11 @@ def setup_telegram():
         }
     )
 
-    # Telegram command menu
+    # ONLY TWO COMMANDS IN TELEGRAM MENU
 
     commands = [
         {
             "command": "status",
-            "description":
-                "Check current stock",
-        },
-        {
-            "command": "stock",
-            "description":
-                "Check current stock",
-        },
-        {
-            "command": "now",
             "description":
                 "Check current stock",
         },
@@ -1124,10 +1059,6 @@ def setup_telegram():
 
 def main():
 
-    # --------------------------------------------
-    # CHECK ENVIRONMENT
-    # --------------------------------------------
-
     if not TELEGRAM_BOT_TOKEN:
 
         raise RuntimeError(
@@ -1145,7 +1076,7 @@ def main():
     )
 
     log(
-        "🛰️ KNIFE MFG DECK RADAR"
+        "📡 KNIFE MFG DECK RADAR"
     )
 
     log(
@@ -1166,21 +1097,15 @@ def main():
         f"{STATE_FILE}"
     )
 
-    # --------------------------------------------
-    # LOAD PREVIOUS STATE
-    # --------------------------------------------
+    # Load previous stock state
 
     load_state()
 
-    # --------------------------------------------
-    # SETUP TELEGRAM
-    # --------------------------------------------
+    # Setup Telegram
 
     setup_telegram()
 
-    # --------------------------------------------
-    # INITIAL STOCK CHECK
-    # --------------------------------------------
+    # Initial stock check
 
     log(
         "Performing initial stock check..."
@@ -1188,9 +1113,7 @@ def main():
 
     check_stock()
 
-    # --------------------------------------------
-    # START TELEGRAM LISTENER
-    # --------------------------------------------
+    # Start Telegram listener
 
     listener = threading.Thread(
         target=telegram_listener,
@@ -1211,9 +1134,7 @@ def main():
         "🚨 Restock monitoring is active."
     )
 
-    # --------------------------------------------
-    # CONTINUOUS STOCK MONITORING
-    # --------------------------------------------
+    # Continuous monitoring
 
     while True:
 
@@ -1236,7 +1157,7 @@ def main():
 
 
 # ============================================================
-# START PROGRAM
+# START
 # ============================================================
 
 if __name__ == "__main__":
