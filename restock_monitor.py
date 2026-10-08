@@ -4,25 +4,58 @@ import os
 import re
 import sys
 import time
+import threading
 import urllib.parse
 import urllib.request
+
 # ============================================================
 # CONFIG
 # ============================================================
+
 SITE = "https://knifemfg.co"
-STATE_FILE = "state.json"
+
+STATE_FILE = os.environ.get(
+    "STATE_FILE",
+    "/data/state.json"
+)
+
 SHAPES = ["KH1", "KL2", "KL1"]
+
+# 5 seconds is aggressive but reasonable.
+CHECK_INTERVAL = int(
+    os.environ.get("CHECK_INTERVAL", "5")
+)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Cache-Control": "no-cache",
 }
+
 LINE = "\u2501" * 14
+
+
 # ============================================================
-# GENERAL HELPERS
+# LIVE SHARED DATA
 # ============================================================
+
+CURRENT_SNAPSHOT = {}
+STATE = {}
+
+LOCK = threading.Lock()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
 def esc(value):
-    return html.escape(str(value or ""))
+    return html.escape(
+        str(value or "")
+    )
+
+
 def shape_of(title):
+
     clean = (
         " "
         + re.sub(
@@ -32,151 +65,229 @@ def shape_of(title):
         )
         + " "
     )
+
     for shape in SHAPES:
+
         if f" {shape} " in clean:
             return shape
+
     return None
+
+
 # ============================================================
-# KNIFE MFG PRODUCT CHECKER
+# KNIFE MFG
 # ============================================================
+
 def fetch_products():
+
     products = []
     page = 1
+
     while True:
+
         url = (
             f"{SITE}/products.json"
             f"?limit=250"
             f"&page={page}"
             f"&_={int(time.time() * 1000)}"
         )
+
         request = urllib.request.Request(
             url,
             headers=HEADERS
         )
+
         with urllib.request.urlopen(
             request,
-            timeout=30
+            timeout=20
         ) as response:
+
             data = json.load(response)
+
         batch = data.get(
             "products",
             []
         )
+
         if not batch:
             break
+
         products.extend(batch)
+
         page += 1
+
+        if page > 50:
+            break
+
     return products
+
+
 def snapshot(products):
+
     snap = {}
+
     for product in products:
-        images = product.get(
-            "images"
-        ) or []
+
+        images = (
+            product.get("images")
+            or []
+        )
+
         image = (
             images[0].get("src")
             if images
             else None
         )
+
         for variant in product.get(
             "variants",
             []
         ):
-            variant_title = (
+
+            title = (
                 variant.get("title")
                 or ""
             )
-            shape = shape_of(
-                variant_title
-            )
+
+            shape = shape_of(title)
+
             if not shape:
                 continue
+
             size = re.sub(
                 rf"\b{shape}\b",
                 "",
-                variant_title,
+                title,
                 flags=re.I
             ).strip()
+
             variant_id = str(
                 variant["id"]
             )
+
+            handle = product.get(
+                "handle",
+                ""
+            )
+
             snap[variant_id] = {
-                "name": product.get(
-                    "title",
-                    ""
-                ),
-                "shape": shape,
-                "size": size,
-                "price": variant.get(
-                    "price"
-                ),
-                "image": image,
-                "available": bool(
+
+                "name":
+                    product.get(
+                        "title",
+                        ""
+                    ),
+
+                "shape":
+                    shape,
+
+                "size":
+                    size,
+
+                "price":
                     variant.get(
-                        "available"
-                    )
-                ),
-                "url": (
+                        "price"
+                    ),
+
+                "image":
+                    image,
+
+                "available":
+                    bool(
+                        variant.get(
+                            "available"
+                        )
+                    ),
+
+                "url":
                     f"{SITE}/products/"
-                    f"{product['handle']}"
-                    f"?variant={variant_id}"
-                ),
-                "cart": (
+                    f"{handle}"
+                    f"?variant={variant_id}",
+
+                "cart":
                     f"{SITE}/cart/"
-                    f"{variant_id}:1"
-                ),
+                    f"{variant_id}:1",
             }
+
     return snap
+
+
 # ============================================================
 # TELEGRAM API
 # ============================================================
-def tg(method, params=None):
-    token = os.environ.get(
-        "TELEGRAM_BOT_TOKEN"
-    )
-    if not token:
+
+def token():
+
+    value = os.environ.get(
+        "TELEGRAM_BOT_TOKEN",
+        ""
+    ).strip()
+
+    if not value:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
+            "TELEGRAM_BOT_TOKEN is missing"
         )
+
+    return value
+
+
+def my_chat_id():
+
+    value = os.environ.get(
+        "TELEGRAM_CHAT_ID",
+        ""
+    ).strip()
+
+    if not value:
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID is missing"
+        )
+
+    return value
+
+
+def tg(method, params=None):
+
     data = urllib.parse.urlencode(
         params or {}
     ).encode()
+
     url = (
-        f"https://api.telegram.org/"
-        f"bot{token}/{method}"
+        "https://api.telegram.org/"
+        f"bot{token()}/{method}"
     )
+
     request = urllib.request.Request(
         url,
         data=data,
         headers={
             "User-Agent":
-                "KnifeMFG-RestockBot/1.0"
+                "KnifeMFG-Radar/1.0"
         }
     )
+
     with urllib.request.urlopen(
         request,
         timeout=35
     ) as response:
+
         result = json.load(response)
+
     if not result.get("ok"):
+
         raise RuntimeError(
-            f"Telegram API error: {result}"
+            str(result)
         )
+
     return result
-def chat_id():
-    value = os.environ.get(
-        "TELEGRAM_CHAT_ID",
-        ""
-    ).strip()
-    if not value:
-        raise RuntimeError(
-            "TELEGRAM_CHAT_ID is missing."
-        )
-    return value
+
+
 # ============================================================
-# TELEGRAM MESSAGES
+# TELEGRAM MESSAGE
 # ============================================================
+
 def buttons(*pairs):
+
     return json.dumps({
         "inline_keyboard": [
             [
@@ -188,454 +299,701 @@ def buttons(*pairs):
             ]
         ]
     })
+
+
 def send_text(
     text,
     markup=None
 ):
+
     params = {
-        "chat_id": chat_id(),
-        "text": text,
-        "parse_mode": "HTML",
+
+        "chat_id":
+            my_chat_id(),
+
+        "text":
+            text,
+
+        "parse_mode":
+            "HTML",
+
         "disable_web_page_preview":
             "true",
     }
+
     if markup:
+
         params[
             "reply_markup"
         ] = markup
+
     return tg(
         "sendMessage",
         params
     )
-# ============================================================
-# RESTOCK ALERT
-# ============================================================
-def alert_caption(item):
-    shape = (
-        f"\U0001F6F9 "
-        f"<b>{esc(item['shape'])}</b>"
-    )
-    if item.get("size"):
-        shape += (
-            f" \u00B7 "
-            f"{esc(item['size'])}"
-        )
-    lines = [
-        "\U0001F7E2 "
-        "<b>DECK IN STOCK</b>",
-        LINE,
-        f"<b>{esc(item['name'])}</b>",
-        shape,
-    ]
-    if item.get("price"):
-        lines.append(
-            f"\U0001F4B5 "
-            f"{esc(item['price'])}"
-        )
-    lines += [
-        LINE,
-        "\u26A1 "
-        "<i>Drops go fast. "
-        "Tap Add to cart.</i>",
-    ]
-    return "\n".join(lines)
-def send_alert(item):
-    caption = alert_caption(
-        item
-    )
-    markup = buttons(
-        (
-            "\U0001F6D2 Add to cart",
-            item["cart"]
-        ),
-        (
-            "\U0001F517 Open page",
-            item["url"]
-        ),
-    )
-    # Try photo first
-    if item.get("image"):
-        try:
-            tg(
-                "sendPhoto",
-                {
-                    "chat_id":
-                        chat_id(),
-                    "photo":
-                        item["image"],
-                    "caption":
-                        caption,
-                    "parse_mode":
-                        "HTML",
-                    "reply_markup":
-                        markup,
-                }
-            )
-            print(
-                "Telegram alert sent:",
-                item["name"],
-                item["shape"]
-            )
-            return
-        except Exception as error:
-            print(
-                "Photo failed:",
-                error
-            )
-    # Fallback to text
-    send_text(
-        caption,
-        markup
-    )
-def send_alerts(items):
-    # Send first 3 individually
-    for item in items[:3]:
-        send_alert(item)
-    # Remaining products
-    remaining = items[3:]
-    if remaining:
-        lines = [
-            "\U0001F7E2 "
-            "<b>MORE IN STOCK</b>",
-            LINE,
-        ]
-        for item in remaining:
-            lines.append(
-                f"\u2022 "
-                f"<b>{esc(item['shape'])}</b> "
-                f"{esc(item['name'])}"
-            )
-        send_text(
-            "\n".join(lines),
-            buttons(
-                (
-                    "\U0001F6D2 Open shop",
-                    SITE
-                )
-            )
-        )
+
+
 # ============================================================
 # STATUS
 # ============================================================
+
 def status_text(snapshot_data):
+
     lines = [
-        "\U0001F4E1 "
-        "<b>Knife MFG "
-        "\u00B7 deck radar</b>",
+
+        "\U0001F6F9 "
+        "<b>KNIFE MFG • LIVE RADAR</b>",
+
         LINE,
     ]
+
     for shape in SHAPES:
+
         live = [
+
             item
-            for item in snapshot_data.values()
+
+            for item
+            in snapshot_data.values()
+
             if (
                 item["shape"] == shape
                 and item["available"]
             )
         ]
+
         if live:
+
             lines.append(
+
                 f"\U0001F7E2 "
                 f"<b>{shape}</b> "
                 f"\u00B7 "
-                f"{len(live)} live"
+                f"{len(live)} IN STOCK"
             )
+
             for item in live[:6]:
+
                 lines.append(
-                    f"    \u2022 "
+
+                    f"   • "
                     f"{esc(item['name'])}"
                 )
+
         else:
+
             lines.append(
-                f"\u26AB "
+
+                f"\U0001F534 "
                 f"<b>{shape}</b> "
-                f"\u00B7 sold out"
+                f"\u00B7 SOLD OUT"
             )
-    lines += [
+
+    lines.extend([
+
         LINE,
-        "\U0001F552 "
-        "checked just now",
-    ]
+
+        "\u26A1 "
+        "<b>RADAR: ONLINE</b>",
+
+        "\U0001F504 "
+        f"SCANNING EVERY {CHECK_INTERVAL}s",
+
+        "\U0001F6A8 "
+        "RESTOCK ALERTS: ON",
+    ])
+
     return "\n".join(lines)
+
+
 HELP = (
+
     "\U0001F6F9 "
-    "<b>Knife MFG restock bot</b>\n"
+    "<b>KNIFE MFG • DROP RADAR</b>\n"
+
     + LINE
+
     + "\n"
-    "I watch KH1, KL2 and KL1 decks "
-    "and automatically notify you "
-    "when one is back in stock.\n\n"
-    "/status \u2013 check current stock\n"
-    "/help \u2013 show this message"
+
+    "\U0001F6A8 "
+    "<b>DROP WATCH ACTIVE</b>\n\n"
+
+    "I'm watching Knife MFG 24/7.\n\n"
+
+    "\U0001F3AF KH1\n"
+    "\U0001F3AF KL2\n"
+    "\U0001F3AF KL1\n\n"
+
+    "Stock detected?\n"
+    "<b>You'll know immediately.</b> \u26A1\n\n"
+
+    "<b>COMMANDS</b>\n"
+
+    "/status \u2014 Check stock\n"
+    "/help \u2014 Show commands\n\n"
+
+    LINE
+
+    + "\n"
+
+    "\U0001F7E2 SYSTEM ONLINE\n"
+    "\u26A1 RADAR ACTIVE\n"
+    "\U0001F6A8 DROP ALERTS ON"
 )
+
+
 # ============================================================
-# TELEGRAM COMMAND HANDLER
+# FAST TELEGRAM LISTENER
 # ============================================================
-def handle_commands(
-    state,
-    snapshot_data
-):
-    offset = int(
-        state.get(
-            "offset",
-            0
-        )
-    )
-    try:
-        result = tg(
-            "getUpdates",
-            {
-                "offset": offset,
-                "timeout": 5,
-                "allowed_updates":
-                    json.dumps(
-                        ["message"]
-                    ),
-            }
-        )
-    except Exception as error:
-        print(
-            "getUpdates error:",
-            error
-        )
-        return
-    updates = result.get(
-        "result",
-        []
-    )
+
+def telegram_listener():
+
+    global STATE
+    global CURRENT_SNAPSHOT
+
     print(
-        "Telegram updates:",
-        len(updates)
+        "Telegram listener started."
     )
-    for update in updates:
-        update_id = update.get(
-            "update_id"
-        )
-        if update_id is not None:
-            state["offset"] = (
-                update_id + 1
-            )
-        message = (
-            update.get("message")
-            or {}
-        )
-        incoming_chat = (
-            message.get("chat")
-            or {}
-        )
-        incoming_chat_id = str(
-            incoming_chat.get(
-                "id",
-                ""
-            )
-        )
-        # Only YOU can control the bot
-        if incoming_chat_id != str(
-            chat_id()
-        ):
-            continue
-        text = (
-            message.get("text")
-            or ""
-        ).strip()
-        if not text:
-            continue
-        parts = text.split()
-        command = (
-            parts[0]
-            .split("@")[0]
-            .lower()
-        )
-        print(
-            "Command received:",
-            command
-        )
-        # /status
-        if command in (
-            "/status",
-            "/now",
-            "/stock",
-        ):
-            send_text(
-                status_text(
-                    snapshot_data
-                ),
-                buttons(
-                    (
-                        "\U0001F6D2 "
-                        "Open shop",
-                        SITE
+
+    while True:
+
+        try:
+
+            with LOCK:
+
+                offset = int(
+                    STATE.get(
+                        "offset",
+                        0
                     )
                 )
+
+            # LONG POLLING
+            #
+            # Telegram keeps this connection open.
+            # When /status arrives, Telegram immediately
+            # returns it to us.
+            result = tg(
+
+                "getUpdates",
+
+                {
+                    "offset":
+                        offset,
+
+                    "timeout":
+                        30,
+
+                    "allowed_updates":
+                        json.dumps(
+                            ["message"]
+                        ),
+                }
             )
-        # /help
-        elif command == "/help":
-            send_text(
-                HELP
+
+            updates = result.get(
+                "result",
+                []
             )
+
+            for update in updates:
+
+                update_id = update.get(
+                    "update_id"
+                )
+
+                if update_id is not None:
+
+                    with LOCK:
+
+                        STATE["offset"] = (
+                            update_id + 1
+                        )
+
+                message = (
+                    update.get("message")
+                    or {}
+                )
+
+                chat = (
+                    message.get("chat")
+                    or {}
+                )
+
+                incoming_id = str(
+                    chat.get(
+                        "id",
+                        ""
+                    )
+                )
+
+                # Only YOUR chat
+                if incoming_id != str(
+                    my_chat_id()
+                ):
+                    continue
+
+                text = (
+                    message.get("text")
+                    or ""
+                ).strip()
+
+                if not text:
+                    continue
+
+                command = (
+                    text.split()[0]
+                    .split("@")[0]
+                    .lower()
+                )
+
+                print(
+                    "COMMAND:",
+                    command
+                )
+
+                # Copy current stock instantly
+                with LOCK:
+
+                    current = dict(
+                        CURRENT_SNAPSHOT
+                    )
+
+                if command in (
+                    "/status",
+                    "/now",
+                    "/stock",
+                ):
+
+                    # INSTANT RESPONSE
+                    send_text(
+                        status_text(
+                            current
+                        ),
+                        buttons(
+                            (
+                                "\U0001F6D2 "
+                                "Open shop",
+                                SITE
+                            )
+                        )
+                    )
+
+                elif command == "/help":
+
+                    send_text(
+                        HELP
+                    )
+
+                with LOCK:
+
+                    save_state(
+                        STATE
+                    )
+
+        except Exception as error:
+
+            print(
+                "Telegram listener error:",
+                error,
+                file=sys.stderr
+            )
+
+            time.sleep(1)
+
+
+# ============================================================
+# RESTOCK ALERT
+# ============================================================
+
+def alert_caption(item):
+
+    shape = (
+        f"\U0001F6F9 "
+        f"<b>{esc(item['shape'])}</b>"
+    )
+
+    if item.get("size"):
+
+        shape += (
+            f" \u00B7 "
+            f"{esc(item['size'])}"
+        )
+
+    lines = [
+
+        "\U0001F6A8 "
+        "<b>RESTOCK DETECTED</b>",
+
+        LINE,
+
+        f"<b>{esc(item['name'])}</b>",
+
+        shape,
+    ]
+
+    if item.get("price"):
+
+        lines.append(
+            f"\U0001F4B5 "
+            f"{esc(item['price'])}"
+        )
+
+    lines.extend([
+
+        LINE,
+
+        "\u26A1 "
+        "<b>DROP IS LIVE</b>",
+    ])
+
+    return "\n".join(lines)
+
+
+def send_alert(item):
+
+    caption = alert_caption(
+        item
+    )
+
+    markup = buttons(
+
+        (
+            "\U0001F6D2 "
+            "ADD TO CART",
+            item["cart"]
+        ),
+
+        (
+            "\U0001F517 "
+            "OPEN PAGE",
+            item["url"]
+        ),
+    )
+
+    if item.get("image"):
+
+        try:
+
+            tg(
+                "sendPhoto",
+                {
+                    "chat_id":
+                        my_chat_id(),
+
+                    "photo":
+                        item["image"],
+
+                    "caption":
+                        caption,
+
+                    "parse_mode":
+                        "HTML",
+
+                    "reply_markup":
+                        markup,
+                }
+            )
+
+            print(
+                "RESTOCK ALERT SENT:",
+                item["name"]
+            )
+
+            return
+
+        except Exception as error:
+
+            print(
+                "Photo alert failed:",
+                error
+            )
+
+    send_text(
+        caption,
+        markup
+    )
+
+
 # ============================================================
 # STATE
 # ============================================================
+
 def load_state():
+
+    directory = os.path.dirname(
+        STATE_FILE
+    )
+
+    if directory:
+
+        try:
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
+        except Exception:
+            pass
+
     if not os.path.exists(
         STATE_FILE
     ):
+
         return {
-            "v": {},
+            "initialized": False,
             "offset": 0,
+            "v": {},
         }
+
     try:
+
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as file:
-            data = json.load(file)
-        if isinstance(
-            data.get("v"),
-            dict
-        ):
-            return data
-        # Support old state format
-        return {
-            "v": data,
-            "offset": 0,
-        }
+
+            return json.load(file)
+
     except Exception:
-        print(
-            "State file invalid. "
-            "Starting fresh."
-        )
+
         return {
-            "v": {},
+            "initialized": False,
             "offset": 0,
+            "v": {},
         }
+
+
 def save_state(state):
-    temp_file = (
-        STATE_FILE + ".tmp"
-    )
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as file:
-        json.dump(
-            state,
-            file,
-            indent=2
-        )
-    os.replace(
-        temp_file,
+
+    directory = os.path.dirname(
         STATE_FILE
     )
-# ============================================================
-# CHECK KNIFE MFG + TELEGRAM
-# ============================================================
-def check_once():
-    print(
-        "\n"
-        "================================"
+
+    if directory:
+
+        try:
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
+        except Exception:
+            pass
+
+    temp = (
+        STATE_FILE + ".tmp"
     )
+
+    try:
+
+        with open(
+            temp,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                state,
+                file,
+                indent=2
+            )
+
+        os.replace(
+            temp,
+            STATE_FILE
+        )
+
+    except Exception as error:
+
+        print(
+            "State save error:",
+            error
+        )
+
+
+# ============================================================
+# STOCK CHECK
+# ============================================================
+
+def check_stock():
+
+    global CURRENT_SNAPSHOT
+    global STATE
+
     print(
         "Checking Knife MFG..."
     )
-    products = fetch_products()
-    print(
-        "Products found:",
-        len(products)
-    )
-    snapshot_data = snapshot(
-        products
-    )
-    print(
-        "Tracked variants:",
-        len(snapshot_data)
-    )
-    state = load_state()
-    old = state.get(
-        "v",
-        {}
-    )
-    # Detect restocks
-    restocked = [
-        item
-        for variant_id, item
-        in snapshot_data.items()
-        if (
-            item["available"]
-            and not old.get(
-                variant_id,
+
+    try:
+
+        products = fetch_products()
+
+        current = snapshot(
+            products
+        )
+
+        with LOCK:
+
+            old = STATE.get(
+                "v",
                 {}
-            ).get(
-                "available",
+            )
+
+            initialized = STATE.get(
+                "initialized",
                 False
             )
-        )
-    ]
-    if restocked:
+
         print(
-            "RESTOCK FOUND:",
-            len(restocked)
+            "Products:",
+            len(products),
+            "| Variants:",
+            len(current)
         )
-        send_alerts(
-            restocked
-        )
-    else:
+
+        # First run creates baseline
+        if not initialized:
+
+            print(
+                "Creating first stock baseline."
+            )
+
+            with LOCK:
+
+                STATE["v"] = current
+
+                STATE["initialized"] = True
+
+                CURRENT_SNAPSHOT = current
+
+                save_state(
+                    STATE
+                )
+
+            return
+
+        # Detect unavailable -> available
+        restocked = []
+
+        for variant_id, item in current.items():
+
+            old_item = old.get(
+                variant_id,
+                {}
+            )
+
+            was_available = bool(
+                old_item.get(
+                    "available",
+                    False
+                )
+            )
+
+            is_available = bool(
+                item.get(
+                    "available",
+                    False
+                )
+            )
+
+            if (
+                is_available
+                and not was_available
+            ):
+
+                restocked.append(
+                    item
+                )
+
+        # Update cached stock FIRST
+        with LOCK:
+
+            CURRENT_SNAPSHOT = current
+
+            STATE["v"] = current
+
+            save_state(
+                STATE
+            )
+
+        if restocked:
+
+            print(
+                "RESTOCK FOUND:",
+                len(restocked)
+            )
+
+            for item in restocked:
+
+                try:
+
+                    send_alert(
+                        item
+                    )
+
+                except Exception as error:
+
+                    print(
+                        "Alert error:",
+                        error
+                    )
+
+        else:
+
+            print(
+                "No restocks."
+            )
+
+    except Exception as error:
+
         print(
-            "No restocks."
+            "Stock check error:",
+            error,
+            file=sys.stderr
         )
-    # Process Telegram commands
-    handle_commands(
-        state,
-        snapshot_data
-    )
-    # Save latest stock
-    state["v"] = (
-        snapshot_data
-    )
-    save_state(
-        state
-    )
-    print(
-        "State saved."
-    )
-    print(
-        "================================\n"
-    )
+
+
 # ============================================================
 # TELEGRAM SETUP
 # ============================================================
+
 def setup_telegram():
+
     print(
         "Connecting to Telegram..."
     )
+
     me = tg(
         "getMe"
     )
+
     bot = me.get(
         "result",
         {}
     )
+
     print(
-        "Bot username:",
+        "Bot:",
         bot.get("username")
     )
-    # Check webhook
+
+    # Remove webhook
     webhook = tg(
         "getWebhookInfo"
     )
+
     webhook_url = (
         webhook
         .get("result", {})
         .get("url", "")
     )
+
     if webhook_url:
+
         print(
             "Webhook detected."
         )
-        print(
-            "Removing webhook..."
-        )
+
         tg(
             "deleteWebhook",
             {
@@ -643,102 +1001,154 @@ def setup_telegram():
                     "false"
             }
         )
+
         print(
             "Webhook removed."
         )
-    # Telegram command menu
+
+    # Command menu
     tg(
+
         "setMyCommands",
+
         {
-            "commands": json.dumps(
-                [
-                    {
-                        "command":
-                            "status",
-                        "description":
-                            "Check current stock",
-                    },
-                    {
-                        "command":
-                            "help",
-                        "description":
-                            "Show bot help",
-                    },
-                ]
-            )
+            "commands":
+                json.dumps(
+                    [
+                        {
+                            "command":
+                                "status",
+
+                            "description":
+                                "Check live stock",
+                        },
+                        {
+                            "command":
+                                "help",
+
+                            "description":
+                                "Show bot info",
+                        },
+                    ]
+                )
         }
     )
+
     print(
-        "Telegram setup complete."
+        "Telegram ready."
     )
+
+
 # ============================================================
 # MAIN
 # ============================================================
+
+def main():
+
+    global STATE
+
+    print(
+        "================================"
+    )
+
+    print(
+        "KNIFE MFG • DROP RADAR"
+    )
+
+    print(
+        "FAST RAILWAY MODE"
+    )
+
+    print(
+        "================================"
+    )
+
+    print(
+        f"Stock scan: every "
+        f"{CHECK_INTERVAL}s"
+    )
+
+    print(
+        "Telegram: LONG POLLING"
+    )
+
+    print(
+        "Commands: NEAR-INSTANT"
+    )
+
+    print(
+        "================================"
+    )
+
+    # Load state
+    STATE = load_state()
+
+    # Telegram
+    setup_telegram()
+
+    # Initial stock check
+    check_stock()
+
+    # Start FAST Telegram listener
+    listener = threading.Thread(
+        target=telegram_listener,
+        daemon=True
+    )
+
+    listener.start()
+
+    print(
+        "================================"
+    )
+
+    print(
+        "🟢 BOT ONLINE 24/7"
+    )
+
+    print(
+        "⚡ TELEGRAM COMMANDS ACTIVE"
+    )
+
+    print(
+        "🔄 STOCK SCANNER ACTIVE"
+    )
+
+    print(
+        "================================"
+    )
+
+    # Main stock loop
+    while True:
+
+        time.sleep(
+            CHECK_INTERVAL
+        )
+
+        check_stock()
+
+
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
+
     try:
-        setup_telegram()
-        # First check immediately
-        check_once()
-        # GitHub Actions settings
-        #
-        # Keep alive for 4 minutes
-        loop_seconds = int(
-            os.environ.get(
-                "LOOP_SECONDS",
-                "240"
-            )
-        )
-        # Check every 30 seconds
-        interval = float(
-            os.environ.get(
-                "INTERVAL",
-                "30"
-            )
-        )
-        start_time = time.time()
+
+        main()
+
+    except KeyboardInterrupt:
+
         print(
-            "================================"
+            "Bot stopped."
         )
-        print(
-            "Knife MFG bot is RUNNING"
-        )
-        print(
-            f"Runtime: "
-            f"{loop_seconds} seconds"
-        )
-        print(
-            f"Interval: "
-            f"{interval} seconds"
-        )
-        print(
-            "Commands: /status /help"
-        )
-        print(
-            "================================"
-        )
-        # Keep bot alive
-        while (
-            time.time() - start_time
-            < loop_seconds
-        ):
-            time.sleep(
-                interval
-            )
-            try:
-                check_once()
-            except Exception as error:
-                print(
-                    "Check error:",
-                    error,
-                    file=sys.stderr
-                )
-        print(
-            "Bot run finished."
-        )
+
     except Exception as error:
+
         print(
             "FATAL ERROR:",
             error,
             file=sys.stderr
         )
+
         sys.exit(1)
