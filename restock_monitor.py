@@ -296,33 +296,42 @@ def group_by_deck(items):
 
 
 def alert_caption(group, test=False):
-    head = "🧪 <b>TEST ALERT</b>" if test else "🚨 <b>KNIFE MFG RESTOCK!</b>"
-    lines = [head, LINE, f"📦 <b>{esc(group[0]['product'])}</b>", ""]
+    """Same look as the original alert: photo on top, then
+    TEST ALERT / DECK IN STOCK, name, shape, price, buttons."""
+    head = "🧪 <b>TEST ALERT</b>" if test else "🟢 <b>DECK IN STOCK</b>"
+    prices = {money(it["price"]) for it in group}
+    one_price = len(prices) == 1 and "" not in prices
+
+    lines = [head, LINE, f"<b>{esc(group[0]['product'])}</b>"]
     for it in group:
         row = f"🛹 <b>{esc(it['shape'])}</b>"
         if it["size"]:
             row += f" · {esc(it['size'])}"
-        if money(it["price"]):
+        if not one_price and money(it["price"]):
             row += f" · {money(it['price'])}"
         lines.append(row)
-    lines.append("")
+    if one_price:
+        lines.append(f"💵 {prices.pop()}")
+
+    lines.append(LINE)
     if test:
-        lines.append("⚡ <i>Sample only. Nothing just restocked.</i>")
+        lines.append("⚡ <i>This is a sample. Nothing just restocked.</i>")
     else:
-        lines += ["🟢 <b>IN STOCK NOW</b>", "⚡ <b>DROP DETECTED</b>"]
-    lines += ["", f"💱 <i>≈ SGD at 1 USD = {FX['rate']:.2f}. Final price at checkout.</i>"]
+        lines.append("⚡ <i>Drops go fast. Tap Add to cart.</i>")
     return "\n".join(lines)
 
 
 def alert_buttons(group):
     if len(group) == 1:
-        buy = [{"text": "🛒 BUY NOW", "url": group[0]["cart_url"]}]
-    else:
-        buy = [
-            {"text": f"🛒 BUY {it['shape']}", "url": it["cart_url"]}
-            for it in group
-        ]
-    view = [{"text": "VIEW DECK", "url": group[0]["product_url"]}]
+        return {"inline_keyboard": [[
+            {"text": "🛒 Add to cart", "url": group[0]["cart_url"]},
+            {"text": "🔗 Open page", "url": group[0]["product_url"]},
+        ]]}
+    buy = [
+        {"text": f"🛒 {it['shape']}", "url": it["cart_url"]}
+        for it in group
+    ]
+    view = [{"text": "🔗 Open page", "url": group[0]["product_url"]}]
     return {"inline_keyboard": [buy, view]}
 
 
@@ -348,13 +357,13 @@ def send_alerts(items):
         send_alert(group)
     rest = groups[MAX_ALERTS_PER_DROP:]
     if rest:
-        lines = ["🚨 <b>MORE IN STOCK</b>", LINE]
+        lines = ["🟢 <b>MORE DECKS IN STOCK</b>", LINE]
         for group in rest:
             shapes = " ".join(it["shape"] for it in group)
             lines.append(f"• <b>{esc(shapes)}</b> {esc(group[0]['product'])}")
         send_text(
             "\n".join(lines),
-            {"inline_keyboard": [[{"text": "🛒 OPEN SHOP", "url": SITE}]]},
+            {"inline_keyboard": [[{"text": "🔗 Open shop", "url": SITE}]]},
         )
 
 
