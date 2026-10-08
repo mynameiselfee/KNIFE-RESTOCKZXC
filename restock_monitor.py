@@ -244,7 +244,8 @@ def telegram_api(method, params=None, _retry=True):
             log(f"Telegram asked to slow down, waiting {wait}s")
             time.sleep(min(int(wait), 10))
             return telegram_api(method, params, _retry=False)
-        log(f"Telegram {method} HTTP {e.code}: {body}")
+        if not (e.code == 409 and method == "getUpdates"):
+            log(f"Telegram {method} HTTP {e.code}: {body}")
         return {"ok": False, "error": f"HTTP {e.code}"}
     except Exception as e:
         log(f"Telegram {method} error: {e}")
@@ -647,6 +648,7 @@ def handle_callback(query):
 
 def telegram_listener(offset):
     log("Telegram listener started.")
+    last_conflict_log = 0.0
     while True:
         try:
             params = {
@@ -658,7 +660,16 @@ def telegram_listener(offset):
 
             result = telegram_api("getUpdates", params)
             if not result.get("ok"):
-                time.sleep(3)
+                if "409" in str(result.get("error", "")):
+                    # another copy is still reading this bot (normal for a minute
+                    # during a redeploy). Wait quietly until it stops.
+                    if time.time() - last_conflict_log > 60:
+                        log("Another copy of this bot is still running (409). "
+                            "Waiting for it to stop. Commands resume by themselves.")
+                        last_conflict_log = time.time()
+                    time.sleep(10)
+                else:
+                    time.sleep(3)
                 continue
 
             for update in result.get("result", []):
