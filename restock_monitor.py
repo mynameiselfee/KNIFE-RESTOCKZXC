@@ -3,6 +3,7 @@ import urllib.error
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -468,17 +469,49 @@ HELP_MARKUP = {
 }
 
 
-def send_test_alert():
-    """Hidden command: /test sends a sample alert (not in the menu)."""
-    with LOCK:
-        items = list(CURRENT_SNAPSHOT.values())
+def send_test_alerts(items):
+    """Sends the real alert layout (TEST header) for every deck that is
+    in stock right now. If nothing is in stock, sends one sample."""
     if not items:
         send_text("⏳ No data yet, try again in a few seconds.")
         return
-    pick = [it for it in items if it["available"]] or items
-    first = pick[0]
-    group = [it for it in items if it["handle"] == first["handle"]][:3]
-    send_alert(group, test=True)
+
+    live = [it for it in items if it["available"]]
+    if not live:
+        send_text(
+            "🧪 <b>TEST</b> · nothing is in stock right now.\n"
+            "Here is a sample so you can see the look:"
+        )
+        first = items[0]
+        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
+        return
+
+    groups = group_by_deck(live)
+    send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
+    for group in groups[:MAX_ALERTS_PER_DROP]:
+        send_alert(group, test=True)
+    if len(groups) > MAX_ALERTS_PER_DROP:
+        send_text(f"🧪 +{len(groups) - MAX_ALERTS_PER_DROP} more deck(s) in stock, not shown.")
+
+
+def send_test_alert():
+    """Hidden command: /test"""
+    with LOCK:
+        items = list(CURRENT_SNAPSHOT.values())
+    send_test_alerts(items)
+
+
+def run_test_once():
+    """python restock_monitor.py --test
+    Reads the shop once, sends test alerts for the decks in stock, then exits.
+    Safe to run while the radar is online: it only sends messages."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
+    refresh_fx()
+    items = list(build_snapshot(fetch_products()).values())
+    log(f"Test: {len(items)} tracked variants, {sum(1 for i in items if i['available'])} in stock")
+    send_test_alerts(items)
+    log("Test alerts sent.")
 
 
 # ============================================================
@@ -741,7 +774,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if "--test" in sys.argv:
+            run_test_once()
+        else:
+            main()
     except KeyboardInterrupt:
         log("Radar stopped.")
     except Exception as e:
