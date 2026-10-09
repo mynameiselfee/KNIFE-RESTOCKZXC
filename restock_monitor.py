@@ -232,6 +232,42 @@ class FetchError(Exception):
     pass
 
 
+class RateLimited(FetchError):
+    """The shop answered 429 (too many requests). Hammering it makes it worse,
+    so this is never retried straight away."""
+
+    def __init__(self, message, retry_after=0.0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# How politely the radar is checking right now. After a 429 it adds a little
+# time between checks and stops adding a cache-buster to the address, then
+# eases back to normal after 30 calm minutes.
+PACE = {"extra": 0.0, "last_limit": 0.0, "buster": os.getenv("CACHE_BUSTER", "1") == "1"}
+
+
+def current_interval():
+    return CHECK_INTERVAL + PACE["extra"]
+
+
+def note_rate_limited():
+    PACE["extra"] = min(10.0, PACE["extra"] + 2.0)
+    PACE["last_limit"] = time.time()
+    PACE["buster"] = False
+
+
+def calm_down():
+    """Called after every good check. Gives back 1 second per 30 calm minutes."""
+    if PACE["extra"] <= 0 and PACE["buster"] == (os.getenv("CACHE_BUSTER", "1") == "1"):
+        return
+    if time.time() - PACE["last_limit"] > 1800:
+        PACE["extra"] = max(0.0, PACE["extra"] - 1.0)
+        PACE["last_limit"] = time.time()
+        if PACE["extra"] == 0:
+            PACE["buster"] = os.getenv("CACHE_BUSTER", "1") == "1"
+
+
 class ShopLocked(FetchError):
     """The shop is showing its password page (before a drop)."""
 
@@ -282,31 +318,36 @@ def fetch_url(url, timeout=20):
         return _read(response)
 
 
-TRANSIENT_CODES = (429, 500, 502, 503, 504)
+TRANSIENT_CODES = (500, 502, 503, 504)
 
 
-def fetch_page_retry(url, tries=3):
-    """Like fetch_page, but if the shop is just busy for a moment (503, 429,
-    a timeout...) it tries again straight away, up to 3 times."""
+def retry_after_seconds(error):
+    try:
+        return max(0.0, float(error.headers.get("Retry-After", 0)))
+    except Exception:
+        return 0.0
+
+
+def fetch_page_retry(url, tries=2):
+    """Like fetch_page, but if the shop has a momentary hiccup (503, a timeout...)
+    it tries once more straight away. A 429 (too many requests) is raised at
+    once as RateLimited so the radar can slow down instead of piling on."""
     last = None
     for attempt in range(tries):
-        wait = 0.7 * (attempt + 1)
         try:
             return fetch_page(url)
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise RateLimited("shop answered 429 (too many requests)", retry_after_seconds(e))
             if e.code not in TRANSIENT_CODES:
                 raise
             last = e
-            try:
-                wait = float(e.headers.get("Retry-After", wait))
-            except Exception:
-                pass
             log(f"Shop answered {e.code}, trying again")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last = e
             log(f"Shop did not answer ({e}), trying again")
         if attempt < tries - 1:
-            time.sleep(min(wait, 5))
+            time.sleep(0.8)
     raise last
 
 
@@ -334,11 +375,13 @@ def page_text(raw):
 def fetch_products_once():
     """All products, or raises FetchError. Never returns a partial list."""
     products = []
-    stamp = int(time.time() * 1000)   # cache buster for the shop's CDN
+    stamp = int(time.time() * 1000)   # makes each request unique so the shop's CDN can't serve an old copy
     for page in range(1, 21):
-        url = f"{SITE}/products.json?limit=250&page={page}&_={stamp}"
+        url = f"{SITE}/products.json?limit=250&page={page}" + (f"&_={stamp}" if PACE["buster"] else "")
         try:
             raw, final_url = fetch_page_retry(url)
+        except RateLimited:
+            raise
         except Exception as e:
             raise FetchError(f"page {page}: {e}")
         if urllib.parse.urlparse(final_url).path.rstrip("/") == "/password":
@@ -497,9 +540,14 @@ def telegram_api(method, params=None, _retry=True):
             log(f"Telegram asked to slow down, waiting {wait}s")
             time.sleep(min(int(wait), 10))
             return telegram_api(method, params, _retry=False)
-        if not (e.code == 409 and method == "getUpdates"):
+        try:
+            description = json.loads(body).get("description", "")
+        except Exception:
+            description = ""
+        harmless = (e.code == 409 and method == "getUpdates") or "not modified" in description
+        if not harmless:
             log(f"Telegram {method} HTTP {e.code}: {body}")
-        return {"ok": False, "error": f"HTTP {e.code}"}
+        return {"ok": False, "error": f"HTTP {e.code}", "description": description}
     except Exception as e:
         log(f"Telegram {method} error: {e}")
         return {"ok": False, "error": str(e)}
@@ -755,7 +803,7 @@ def status_text():
     if age > max(30, CHECK_INTERVAL * 6):
         lines.append(f"⚠️ store unreachable · data is {ago(age)[:-4]} old")
     else:
-        lines.append(f"🕒 checked {ago(age)} · every {CHECK_INTERVAL:g}s")
+        lines.append(f"🕒 checked {ago(age)} · every {current_interval():g}s")
     if last_drop:
         lines.append(
             f"🎯 last drop · {' '.join(last_drop['shapes'])} {esc(last_drop['product'])}"
@@ -777,7 +825,7 @@ def help_text():
         "/status — stock right now\n"
         "/help — this screen\n"
         f"{LINE}\n"
-        f"🟢 online · checking every {CHECK_INTERVAL:g}s\n"
+        f"🟢 online · checking every {current_interval():g}s\n"
         f"💱 prices ≈ S$ (1 USD = {FX['rate']:.2f})"
     )
 
@@ -799,7 +847,7 @@ def maybe_daily_ping():
         "💚 <b>Still watching</b>\n"
         f"{LINE}\n"
         f"🎯 {total} variants · {live} in stock\n"
-        f"🕒 checking every {CHECK_INTERVAL:g}s"
+        f"🕒 checking every {current_interval():g}s"
     )
 
 
@@ -997,15 +1045,11 @@ def handle_callback(query):
     if chat_id != str(TELEGRAM_CHAT_ID):
         return
     data = query.get("data", "")
+
     if data.startswith("so:"):
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": query["id"],
-            "text": f"{data[3:]} is sold out right now.",
-        })
-        return
-    telegram_api("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Refreshed ✓"})
-    if data == "refresh":
-        telegram_api("editMessageText", {
+        toast = f"{data[3:]} is sold out right now."
+    elif data == "refresh":
+        result = telegram_api("editMessageText", {
             "chat_id": chat_id,
             "message_id": query["message"]["message_id"],
             "text": status_text(),
@@ -1013,6 +1057,11 @@ def handle_callback(query):
             "disable_web_page_preview": "true",
             "reply_markup": json.dumps(STATUS_MARKUP),
         })
+        unchanged = "not modified" in str(result.get("description", ""))
+        toast = "Already up to date ✓" if unchanged else "Refreshed ✓"
+    else:
+        toast = "✓"
+    telegram_api("answerCallbackQuery", {"callback_query_id": query["id"], "text": toast})
 
 
 def telegram_listener(offset):
@@ -1122,7 +1171,7 @@ def main():
             "📡 <b>Deck radar online</b>",
             LINE,
             f"🎯 tracking {total} variants · {live} in stock",
-            f"⚡ checking every {CHECK_INTERVAL:g}s",
+            f"⚡ checking every {current_interval():g}s",
         ]
         if not MEMORY_OK:
             lines.append("⚠️ no saved memory: add a Railway Volume at /data")
@@ -1132,6 +1181,9 @@ def main():
 
     fails = 0
     warned = False
+    limited = 0            # 429 answers in a row
+    limited_warned = False
+    throttle = 0.0         # extra seconds to wait while the shop is rate limiting
     while True:
         started = time.time()
         refresh_fx()
@@ -1139,6 +1191,12 @@ def main():
         maybe_daily_ping()
         try:
             check_stock()
+            calm_down()
+            throttle = throttle / 2 if throttle > 5 else 0.0
+            limited = 0
+            if limited_warned:
+                send_text("🟢 <b>Checks are back to normal.</b>")
+                limited_warned = False
             if warned:
                 send_text("🟢 <b>Radar is back online.</b>")
                 warned = False
@@ -1146,6 +1204,18 @@ def main():
         except ShopLocked as e:
             note_locked(e.text)       # normal before a drop: no error, no backoff
             fails = 0
+        except RateLimited as e:
+            note_rate_limited()
+            limited += 1
+            throttle = min(300.0, max(e.retry_after, throttle * 2 if throttle else 20.0))
+            log(f"Shop is rate limiting (429). Waiting {throttle:.0f}s, then checking a little slower "
+                f"(every {current_interval():g}s). {limited} in a row.")
+            if limited >= 3 and not limited_warned:
+                send_text(
+                    "⚠️ <b>The shop is limiting my checks (429).</b>\n"
+                    "I'm slowing down by myself. Alerts can be a few seconds later until it calms down."
+                )
+                limited_warned = True
         except Exception as e:
             fails += 1
             log(f"Check failed ({fails} in a row): {e}")
@@ -1154,8 +1224,8 @@ def main():
                 warned = True
 
         # back off when the shop is struggling; a little jitter keeps the rhythm irregular
-        delay = CHECK_INTERVAL if fails <= 1 else min(60, CHECK_INTERVAL * 2 ** min(fails - 1, 4))
-        time.sleep(max(0, delay + random.uniform(0, 0.4) - (time.time() - started)))
+        base = current_interval() if fails <= 1 else min(60, current_interval() * 2 ** min(fails - 1, 4))
+        time.sleep(max(0, base + throttle + random.uniform(0, 0.4) - (time.time() - started)))
 
 
 if __name__ == "__main__":
