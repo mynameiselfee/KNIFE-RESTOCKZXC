@@ -247,6 +247,9 @@ class RateLimited(FetchError):
 PACE = {"extra": 0.0, "last_limit": 0.0, "buster": os.getenv("CACHE_BUSTER", "1") == "1"}
 
 
+HEALTH = {"error": ""}      # why the last check failed ("" = all good)
+
+
 def current_interval():
     return CHECK_INTERVAL + PACE["extra"]
 
@@ -783,6 +786,12 @@ def status_text():
         hint = "🔑 password saved" if shop_password() else "🔑 got the password? send /password"
         return "\n".join(head + ["🔒 shop is behind a password", "⚡ watching for it to open", hint])
     if not snapshot:
+        if HEALTH["error"]:
+            return "\n".join(head + [
+                f"⚠️ I can't read the shop yet: {HEALTH['error']}",
+                f"🔁 still trying by myself, about every {current_interval():g}s or slower",
+                "Alerts start as soon as it answers.",
+            ])
         return "\n".join(head + ["⏳ warming up, try again in a few seconds"])
 
     lines = list(head)
@@ -801,7 +810,8 @@ def status_text():
     lines.append(LINE)
     age = time.time() - last_check
     if age > max(30, CHECK_INTERVAL * 6):
-        lines.append(f"⚠️ store unreachable · data is {ago(age)[:-4]} old")
+        reason = HEALTH["error"] or "store unreachable"
+        lines.append(f"⚠️ {reason} · data is {ago(age)[:-4]} old")
     else:
         lines.append(f"🕒 checked {ago(age)} · every {current_interval():g}s")
     if last_drop:
@@ -1158,7 +1168,12 @@ def main():
         check_stock()
     except ShopLocked as e:
         note_locked(e.text)
+    except RateLimited:
+        note_rate_limited()
+        HEALTH["error"] = "the shop is limiting my checks (429)"
+        log("Initial check: the shop is rate limiting (429). The radar will keep trying.")
     except Exception as e:
+        HEALTH["error"] = "the shop isn't answering"
         log(f"Initial check failed: {e}")
 
     threading.Thread(target=telegram_listener, args=(offset,), daemon=True).start()
@@ -1191,6 +1206,7 @@ def main():
         maybe_daily_ping()
         try:
             check_stock()
+            HEALTH["error"] = ""
             calm_down()
             throttle = throttle / 2 if throttle > 5 else 0.0
             limited = 0
@@ -1205,6 +1221,7 @@ def main():
             note_locked(e.text)       # normal before a drop: no error, no backoff
             fails = 0
         except RateLimited as e:
+            HEALTH["error"] = "the shop is limiting my checks (429)"
             note_rate_limited()
             limited += 1
             throttle = min(300.0, max(e.retry_after, throttle * 2 if throttle else 20.0))
@@ -1218,6 +1235,7 @@ def main():
                 limited_warned = True
         except Exception as e:
             fails += 1
+            HEALTH["error"] = "the shop isn't answering"
             log(f"Check failed ({fails} in a row): {e}")
             if fails >= OFFLINE_AFTER and not warned:
                 send_text("⚠️ <b>Radar can't reach the store.</b>\nStill trying. I'll tell you when it's back.")
