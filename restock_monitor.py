@@ -556,20 +556,34 @@ def alert_caption(group, test=False):
     if test:
         lines.append("⚡ <i>This is a sample. Nothing just restocked.</i>")
     else:
-        lines.append("⚡ <i>Drops go fast. Tap Quick checkout.</i>")
+        lines.append("⚡ <i>Drops go fast. Tap your size.</i>")
     return "\n".join(lines)
 
 
+def deck_variants(handle):
+    """shape -> item, for one deck, from the latest read of the shop."""
+    with DATA_LOCK:
+        items = list(CURRENT_SNAPSHOT.values())
+    return {it["shape"]: it for it in items if it["handle"] == handle}
+
+
 def alert_buttons(group):
-    if len(group) == 1:
-        it = group[0]
-        return {"inline_keyboard": [
-            [{"text": "⚡ Quick checkout", "url": it["cart_url"]},
-             {"text": "🛒 Cart page", "url": it["cart_page_url"]}],
-            [{"text": "🔗 Open page", "url": it["product_url"]}],
-        ]}
-    buy = [{"text": f"⚡ {it['shape']}", "url": it["cart_url"]} for it in group]
-    return {"inline_keyboard": [buy, [{"text": "🔗 Open page", "url": group[0]["product_url"]}]]}
+    """Always the same four buttons in the same order: KH1 KL2 KL1 KB1.
+    ⚡ = in stock (opens checkout for that size), ✖ = sold out (tap shows a note)."""
+    live = {it["shape"]: it for it in group}
+    live.update({sh: it for sh, it in deck_variants(group[0]["handle"]).items() if it["available"]})
+    row = []
+    for shape in SHAPES:
+        if shape in live:
+            row.append({"text": f"⚡ {shape}", "url": live[shape]["cart_url"]})
+        else:
+            row.append({"text": f"✖ {shape}", "callback_data": f"so:{shape}"})
+    first = next(iter(live.values()))
+    return {"inline_keyboard": [
+        row,
+        [{"text": "🔗 Open page", "url": first["product_url"]},
+         {"text": "🛒 Cart page", "url": first["cart_page_url"]}],
+    ]}
 
 
 def send_alert(group, test=False):
@@ -624,12 +638,9 @@ def send_test_alerts(items):
         return
     live = [it for it in items if it["available"]]
     if not live:
-        send_text("🧪 <b>TEST</b> · nothing is in stock right now.\nHere are two samples so you can see both looks:")
+        send_text("🧪 <b>TEST</b> · nothing is in stock right now.\nHere is a sample so you can see the look:")
         first = items[0]
-        deck = [it for it in items if it["handle"] == first["handle"]]
-        send_alert(deck[:1], test=True)           # one size: Quick checkout + Cart page
-        if len(deck) > 1:
-            send_alert(deck[:2], test=True)       # two sizes: one ⚡ button per size
+        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
         return
     groups = group_by_deck(live)
     send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
@@ -949,8 +960,15 @@ def handle_callback(query):
     chat_id = str(query.get("message", {}).get("chat", {}).get("id", ""))
     if chat_id != str(TELEGRAM_CHAT_ID):
         return
+    data = query.get("data", "")
+    if data.startswith("so:"):
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": query["id"],
+            "text": f"{data[3:]} is sold out right now.",
+        })
+        return
     telegram_api("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Refreshed ✓"})
-    if query.get("data") == "refresh":
+    if data == "refresh":
         telegram_api("editMessageText", {
             "chat_id": chat_id,
             "message_id": query["message"]["message_id"],
