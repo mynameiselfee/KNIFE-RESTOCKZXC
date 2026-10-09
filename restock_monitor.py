@@ -568,19 +568,27 @@ def deck_variants(handle):
 
 
 def alert_buttons(group):
-    """Always the same four buttons in the same order: KH1 KL2 KL1 KB1.
+    """The same four size buttons every time, in the same order: KH1 KL2 KL1 KB1,
+    two per row so the size fits on the button.
     ⚡ = in stock (opens checkout for that size), ✖ = sold out (tap shows a note)."""
+    deck = deck_variants(group[0]["handle"])
     live = {it["shape"]: it for it in group}
-    live.update({sh: it for sh, it in deck_variants(group[0]["handle"]).items() if it["available"]})
-    row = []
+    live.update({sh: it for sh, it in deck.items() if it["available"]})
+
+    buttons = []
     for shape in SHAPES:
+        item = live.get(shape) or deck.get(shape)
+        size = item["size"] if item and item.get("size") else ""
+        label = f"{shape} · {size}" if size else shape
         if shape in live:
-            row.append({"text": f"⚡ {shape}", "url": live[shape]["cart_url"]})
+            buttons.append({"text": f"⚡ {label}", "url": live[shape]["cart_url"]})
         else:
-            row.append({"text": f"✖ {shape}", "callback_data": f"so:{shape}"})
+            buttons.append({"text": f"✖ {label}", "callback_data": f"so:{shape}"})
+
     first = next(iter(live.values()))
     return {"inline_keyboard": [
-        row,
+        buttons[0:2],
+        buttons[2:4],
         [{"text": "🔗 Open page", "url": first["product_url"]},
          {"text": "🛒 Cart page", "url": first["cart_page_url"]}],
     ]}
