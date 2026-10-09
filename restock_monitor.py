@@ -1,799 +1,219 @@
+"""
+FAKE KNIFE SHOP for testing the restock bot. Nothing here is real.
+
+It behaves like a Shopify shop:
+  /products.json        the product list the bot reads
+  /password             the password page (when the shop is locked)
+  /cart/<id>:1          a fake checkout page
+  /admin?key=...        your remote control: lock, unlock, set the
+                        password, flip decks in and out of stock
+
+Run it:  python fake_shop.py        (uses the PORT variable, default 8080)
+Remote control key: ADMIN_KEY variable (default "letmein").
+"""
 import html
-import urllib.error
 import json
 import os
-import re
-import sys
 import threading
-import time
 import urllib.parse
-import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-SITE = "https://knifemfg.co"
-SHAPES = ["KH1", "KL2", "KL1", "KB1"]
-
-CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "5")))
-STARTUP_PING = os.getenv("STARTUP_PING", "1") == "1"
-LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))  # 1 = log every check, 60 = about every 5 min
-OFFLINE_AFTER = 6            # failed checks in a row before a warning
-MAX_ALERTS_PER_DROP = 4      # photo alerts per check, the rest go in one list
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; KnifeMFG-DeckRadar/1.1)",
-    "Accept": "application/json,text/plain,*/*",
-    "Cache-Control": "no-cache",
-}
-
-LINE = "━━━━━━━━━━━━━━"
-
-
-def log(message):
-    print(f"[RADAR] {message}", flush=True)
-
-
-# ============================================================
-# STATE FILE
-# Uses /data (Railway volume) when it is writable, otherwise
-# falls back to a local file so the radar never crashes.
-# ============================================================
-
-def pick_state_file():
-    wanted = os.getenv("STATE_FILE", "/data/state.json")
-    try:
-        os.makedirs(os.path.dirname(wanted) or ".", exist_ok=True)
-        probe = wanted + ".probe"
-        with open(probe, "w") as f:
-            f.write("ok")
-        os.remove(probe)
-        return wanted
-    except Exception as e:
-        log(f"State path {wanted} is not writable ({e}). Using ./state.json")
-        log("Add a Railway Volume mounted at /data to keep state between deploys.")
-        return "state.json"
-
-
-STATE_FILE = pick_state_file()
-
-STATE = {}                 # variant_id -> was in stock (bool)
-CURRENT_SNAPSHOT = {}      # variant_id -> item dict
+PORT = int(os.getenv("PORT", "8080"))
+ADMIN_KEY = os.getenv("ADMIN_KEY", "letmein")
 LOCK = threading.Lock()
 
-# ---- USD -> SGD (the shop's base prices are in USD) ----
-# Set USD_TO_SGD on Railway to pin a fixed rate instead of the live one.
-FX_FIXED = bool(os.getenv("USD_TO_SGD"))
-FX = {"rate": float(os.getenv("USD_TO_SGD", "1.29")), "t": 0.0}
-FX_SOURCES = [
-    ("https://api.frankfurter.app/latest?from=USD&to=SGD", lambda d: d["rates"]["SGD"]),
-    ("https://open.er-api.com/v6/latest/USD", lambda d: d["rates"]["SGD"]),
+STATE = {
+    "locked": False,
+    "password": "dropday",
+    "message": "DROP TONIGHT 8PM. Password is in our IG story.",
+}
+
+DECKS = [
+    ("Fake Deck One", "fake-deck-one", 100),
+    ("Fake Deck Two", "fake-deck-two", 200),
+    ("Fake Deck Three", "fake-deck-three", 300),
 ]
-
-
-def refresh_fx():
-    """Update the rate at most every 6 hours. Never raises."""
-    if FX_FIXED or time.time() - FX["t"] < 6 * 3600:
-        return
-    for url, pick in FX_SOURCES:
-        try:
-            rate = float(pick(json.loads(fetch_url(url, timeout=8).decode("utf-8"))))
-            if 0.5 < rate < 3:
-                FX["rate"], FX["t"] = rate, time.time()
-                log(f"USD to SGD rate: {rate:.4f}")
-                return
-        except Exception as e:
-            log(f"Rate source failed: {e}")
-    FX["t"] = time.time() - 6 * 3600 + 600  # try again in 10 minutes
-
-LAST_CHECK = 0.0           # when the store was last read successfully
-STARTED = time.time()
-META_FILE = STATE_FILE + ".meta"
-META = {"last_drop": None}  # {"t", "shapes", "product"}
-
-
-def load_meta():
-    try:
-        if os.path.exists(META_FILE):
-            with open(META_FILE, "r", encoding="utf-8") as f:
-                META.update(json.load(f))
-    except Exception as e:
-        log(f"Could not load meta: {e}")
-
-
-def save_meta():
-    try:
-        temp = META_FILE + ".tmp"
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump(META, f)
-        os.replace(temp, META_FILE)
-    except Exception as e:
-        log(f"Could not save meta: {e}")
-
-
-def remember_drop(items):
-    first = group_by_deck(items)[0]
-    META["last_drop"] = {
-        "t": time.time(),
-        "shapes": [it["shape"] for it in first],
-        "product": first[0]["product"],
-    }
-    save_meta()
-
-
-def esc(text):
-    return html.escape(str(text or ""))
-
-
-# ============================================================
-# FETCH
-# ============================================================
-
-class FetchError(Exception):
-    pass
-
-
-def fetch_url(url, timeout=20):
-    request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
-
-
-def fetch_products():
-    """All products, or raises FetchError. Never returns a partial list."""
-    products = []
-    stamp = int(time.time() * 1000)  # cache buster for the store's CDN
-    for page in range(1, 21):
-        url = f"{SITE}/products.json?limit=250&page={page}&_={stamp}"
-        try:
-            data = json.loads(fetch_url(url).decode("utf-8"))
-        except Exception as e:
-            raise FetchError(f"page {page}: {e}")
-        batch = data.get("products", [])
-        products.extend(batch)
-        if len(batch) < 250:
-            break
-    if not products:
-        raise FetchError("empty product list")
-    return products
-
-
-# ============================================================
-# SNAPSHOT
-# ============================================================
-
-def extract_shape(title):
-    """Whole-word match, so KL1 never matches KL10 or XKL1."""
-    clean = " " + re.sub(r"[^A-Z0-9]+", " ", str(title or "").upper()) + " "
-    for shape in SHAPES:
-        if f" {shape} " in clean:
-            return shape
-    return None
-
-
-def build_snapshot(products):
-    snapshot = {}
-    for product in products:
-        name = product.get("title", "Unknown Product")
-        handle = product.get("handle", "")
-        base_url = f"{SITE}/products/{handle}" if handle else SITE
-        images = product.get("images") or []
-        image = images[0].get("src", "") if images else ""
-
-        for variant in product.get("variants", []):
-            vid = str(variant.get("id", ""))
-            if not vid:
-                continue
-            shape = extract_shape(variant.get("title", ""))
-            if not shape:
-                continue
-            title = variant.get("title", "")
-            size = re.sub(rf"\b{shape}\b", "", title, flags=re.I).strip(" -/·")
-            snapshot[vid] = {
-                "id": vid,
-                "product": name,
-                "handle": handle or name,
-                "variant": title,
-                "size": size,
-                "shape": shape,
-                "price": variant.get("price", ""),
-                "available": bool(variant.get("available", False)),
-                "image": image,
-                "product_url": base_url,
-                "variant_url": f"{base_url}?variant={vid}",
-                "cart_url": f"{SITE}/cart/{vid}:1",
-            }
-    return snapshot
-
-
-# ============================================================
-# TELEGRAM API
-# ============================================================
-
-def telegram_api(method, params=None, _retry=True):
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    encoded = urllib.parse.urlencode(params or {}).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=encoded,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=40) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8")[:200]
-        except Exception:
-            pass
-        if e.code == 429 and _retry:
-            try:
-                wait = json.loads(body).get("parameters", {}).get("retry_after", 2)
-            except Exception:
-                wait = 2
-            log(f"Telegram asked to slow down, waiting {wait}s")
-            time.sleep(min(int(wait), 10))
-            return telegram_api(method, params, _retry=False)
-        if not (e.code == 409 and method == "getUpdates"):
-            log(f"Telegram {method} HTTP {e.code}: {body}")
-        return {"ok": False, "error": f"HTTP {e.code}"}
-    except Exception as e:
-        log(f"Telegram {method} error: {e}")
-        return {"ok": False, "error": str(e)}
-
-    if not result.get("ok"):
-        log(f"Telegram {method} not ok: {result}")
-    return result
-
-
-def send_text(text, reply_markup=None):
-    params = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }
-    if reply_markup:
-        params["reply_markup"] = json.dumps(reply_markup)
-    return telegram_api("sendMessage", params)
-
-
-def send_photo(photo, caption, reply_markup=None):
-    params = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "photo": photo,
-        "caption": caption,
-        "parse_mode": "HTML",
-    }
-    if reply_markup:
-        params["reply_markup"] = json.dumps(reply_markup)
-    return telegram_api("sendPhoto", params)
-
-
-# ============================================================
-# ALERTS
-# One alert per DECK. If several shapes restock together they
-# share one photo and get one BUY button each.
-# ============================================================
-
-def group_by_deck(items):
-    groups = {}
-    for item in items:
-        groups.setdefault(item["handle"], []).append(item)
-    order = {s: i for i, s in enumerate(SHAPES)}
-    result = []
-    for group in groups.values():
-        group.sort(key=lambda it: order.get(it["shape"], 99))
-        result.append(group)
-    return result
-
-
-def alert_caption(group, test=False):
-    """Same look as the original alert: photo on top, then
-    TEST ALERT / DECK IN STOCK, name, shape, price, buttons."""
-    head = "🧪 <b>TEST ALERT</b>" if test else "🟢 <b>DECK IN STOCK</b>"
-    prices = {money(it["price"]) for it in group}
-    one_price = len(prices) == 1 and "" not in prices
-
-    lines = [head, LINE, f"<b>{esc(group[0]['product'])}</b>"]
-    for it in group:
-        row = f"🛹 <b>{esc(it['shape'])}</b>"
-        if it["size"]:
-            row += f" · {esc(it['size'])}"
-        if not one_price and money(it["price"]):
-            row += f" · {money(it['price'])}"
-        lines.append(row)
-    if one_price:
-        lines.append(f"💵 {prices.pop()}")
-
-    lines.append(LINE)
-    if test:
-        lines.append("⚡ <i>This is a sample. Nothing just restocked.</i>")
-    else:
-        lines.append("⚡ <i>Drops go fast. Tap Add to cart.</i>")
-    return "\n".join(lines)
-
-
-def alert_buttons(group):
-    if len(group) == 1:
-        return {"inline_keyboard": [[
-            {"text": "🛒 Add to cart", "url": group[0]["cart_url"]},
-            {"text": "🔗 Open page", "url": group[0]["product_url"]},
-        ]]}
-    buy = [
-        {"text": f"🛒 {it['shape']}", "url": it["cart_url"]}
-        for it in group
-    ]
-    view = [{"text": "🔗 Open page", "url": group[0]["product_url"]}]
-    return {"inline_keyboard": [buy, view]}
-
-
-def send_alert(group, test=False):
-    log(
-        ("TEST ALERT: " if test else "RESTOCK DETECTED: ")
-        + f"{group[0]['product']} ({', '.join(it['shape'] for it in group)})"
-    )
-    caption = alert_caption(group, test)
-    markup = alert_buttons(group)
-    image = group[0].get("image")
-
-    if image:
-        if send_photo(image, caption, markup).get("ok"):
-            return
-    # Fallback: same message as text, buttons kept
-    send_text(caption, markup)
-
-
-def send_alerts(items):
-    groups = group_by_deck(items)
-    for group in groups[:MAX_ALERTS_PER_DROP]:
-        send_alert(group)
-    rest = groups[MAX_ALERTS_PER_DROP:]
-    if rest:
-        lines = ["🟢 <b>MORE DECKS IN STOCK</b>", LINE]
-        for group in rest:
-            shapes = " ".join(it["shape"] for it in group)
-            lines.append(f"• <b>{esc(shapes)}</b> {esc(group[0]['product'])}")
-        send_text(
-            "\n".join(lines),
-            {"inline_keyboard": [[{"text": "🔗 Open shop", "url": SITE}]]},
-        )
-
-
-# ============================================================
-# /STATUS and /HELP
-# ============================================================
-
-def ago(seconds):
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds}s ago"
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours = minutes // 60
-    if hours < 48:
-        return f"{hours}h ago"
-    return f"{hours // 24}d ago"
-
-
-def money(price):
-    """Shop price (USD) shown as approximate Singapore dollars."""
-    try:
-        return f"~S${float(price) * FX['rate']:.0f}"
-    except Exception:
-        return ""
-
-
-STATUS_MARKUP = {
-    "inline_keyboard": [[
-        {"text": "🔄 Refresh", "callback_data": "refresh"},
-        {"text": "🛒 Open shop", "url": SITE},
-    ]]
-}
-
-
-def status_text():
-    with LOCK:
-        snapshot = dict(CURRENT_SNAPSHOT)
-        last_check = LAST_CHECK
-        last_drop = META.get("last_drop")
-
-    head = ["📡 <b>Knife MFG · deck radar</b>", LINE]
-
-    if not snapshot:
-        return "\n".join(head + ["⏳ warming up, try again in a few seconds"])
-
-    lines = list(head)
-    for shape in SHAPES:
-        live = [
-            it for it in snapshot.values()
-            if it["shape"] == shape and it["available"]
-        ]
-        if live:
-            lines.append(f"🟢 <b>{shape}</b> · {len(live)} in stock")
-            for it in live[:5]:
-                price = money(it["price"])
-                tail = f" · {price}" if price else ""
-                lines.append(f"      ▸ {esc(it['product'])}{tail}")
-            if len(live) > 5:
-                lines.append(f"      ▸ +{len(live) - 5} more")
-        else:
-            lines.append(f"⚫ <b>{shape}</b> · sold out")
-
-    lines.append(LINE)
-    age = time.time() - last_check
-    if age > max(30, CHECK_INTERVAL * 6):
-        lines.append(f"⚠️ store unreachable · data is {ago(age)[:-4]} old")
-    else:
-        lines.append(f"🕒 checked {ago(age)} · every {CHECK_INTERVAL:g}s")
-    if last_drop:
-        what = " ".join(last_drop["shapes"])
-        lines.append(
-            f"🎯 last drop · {what} {esc(last_drop['product'])} · {ago(time.time() - last_drop['t'])}"
-        )
-    return "\n".join(lines)
-
-
-def help_text():
-    shapes = "  ".join(f"🎯 {shape}" for shape in SHAPES)
-    return (
-        "📡 <b>Knife MFG · deck radar</b>\n"
-        f"{LINE}\n"
-        "I watch the shop 24/7 and ping you the second a deck is back.\n"
-        "\n"
-        f"{shapes}\n"
-        "\n"
-        "<b>Commands</b>\n"
-        "/status — stock right now\n"
-        "/help — this screen\n"
-        f"{LINE}\n"
-        f"🟢 online · checking every {CHECK_INTERVAL:g}s\n"
-        f"💱 prices ≈ S$ (1 USD = {FX['rate']:.2f})"
-    )
-
-
-HELP_MARKUP = {
-    "inline_keyboard": [[
-        {"text": "📡 Status", "callback_data": "refresh"},
-        {"text": "🛒 Open shop", "url": SITE},
-    ]]
-}
-
-
-def send_test_alerts(items):
-    """Sends the real alert layout (TEST header) for every deck that is
-    in stock right now. If nothing is in stock, sends one sample."""
-    if not items:
-        send_text("⏳ No data yet, try again in a few seconds.")
-        return
-
-    live = [it for it in items if it["available"]]
-    if not live:
-        send_text(
-            "🧪 <b>TEST</b> · nothing is in stock right now.\n"
-            "Here is a sample so you can see the look:"
-        )
-        first = items[0]
-        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
-        return
-
-    groups = group_by_deck(live)
-    send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
-    for group in groups[:MAX_ALERTS_PER_DROP]:
-        send_alert(group, test=True)
-    if len(groups) > MAX_ALERTS_PER_DROP:
-        send_text(f"🧪 +{len(groups) - MAX_ALERTS_PER_DROP} more deck(s) in stock, not shown.")
-
-
-def send_test_alert():
-    """Hidden command: /test"""
-    with LOCK:
-        items = list(CURRENT_SNAPSHOT.values())
-    send_test_alerts(items)
-
-
-def run_test_once():
-    """python restock_monitor.py --test
-    Reads the shop once, sends test alerts for the decks in stock, then exits.
-    Safe to run while the radar is online: it only sends messages."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
-    refresh_fx()
-    items = list(build_snapshot(fetch_products()).values())
-    log(f"Test: {len(items)} tracked variants, {sum(1 for i in items if i['available'])} in stock")
-    send_test_alerts(items)
-    log("Test alerts sent.")
-
-
-# ============================================================
-# STATE LOAD / SAVE
-# ============================================================
-
-def load_state():
-    global STATE
-    try:
-        if not os.path.exists(STATE_FILE):
-            STATE = {}
-            log("No previous state found.")
-            return
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        # accepts {"id": true/false} (this script) and ignores other formats
-        STATE = {k: bool(v) for k, v in raw.items() if isinstance(v, bool)}
-        log(f"Loaded state: {len(STATE)} variants")
-    except Exception as e:
-        log(f"Could not load state: {e}")
-        STATE = {}
-
-
-def save_state():
-    try:
-        temp = STATE_FILE + ".tmp"
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump(STATE, f)
-        os.replace(temp, STATE_FILE)
-    except Exception as e:
-        log(f"Could not save state: {e}")
-
-
-# ============================================================
-# STOCK CHECK
-# Raises FetchError on any problem, so the snapshot and state
-# are never replaced by half-fetched data.
-# ============================================================
-
-_last_available = None
-_quiet_checks = 0
-
-
-def check_stock():
-    global CURRENT_SNAPSHOT, LAST_CHECK, _last_available, _quiet_checks
-
-    started = time.time()
-    snapshot = build_snapshot(fetch_products())
-    took = time.time() - started
-    if not snapshot:
-        raise FetchError("no tracked shapes in the feed")
-
-    alerts = []
-    changed = False
-
-    with LOCK:
-        first_run = not STATE
-        for key, item in snapshot.items():
-            now = item["available"]
-            was = STATE.get(key, False)
-            if not first_run and now and not was:
-                alerts.append(item)
-            if STATE.get(key) != now:
-                STATE[key] = now
-                changed = True
-        CURRENT_SNAPSHOT = snapshot
-        LAST_CHECK = time.time()
-        if changed:
-            save_state()
-
-    available = sum(1 for it in snapshot.values() if it["available"])
-
-    if first_run:
-        log(f"Baseline created: {len(snapshot)} variants, {available} in stock")
-        return
-
-    if alerts:
-        remember_drop(alerts)
-        send_alerts(alerts)
-
-    # quiet by default: only when something changes, or every LOG_EVERY checks
-    _quiet_checks += 1
-    if available != _last_available or _quiet_checks >= LOG_EVERY:
-        log(f"{len(snapshot)} variants | {available} in stock | {took:.1f}s")
-        _last_available = available
-        _quiet_checks = 0
-
-
-# ============================================================
-# TELEGRAM LISTENER
-# ============================================================
-
-def drop_stale_updates():
-    """Skip commands sent while the radar was off, so a restart
-    never replays old /status or /test messages."""
-    result = telegram_api("getUpdates", {"offset": -1, "timeout": 0})
-    updates = result.get("result", []) if result.get("ok") else []
-    if updates:
-        return updates[-1]["update_id"] + 1
-    return None
-
-
-def handle_command(command):
-    if command == "/status":
-        send_text(status_text(), STATUS_MARKUP)
-    elif command in ("/help", "/start"):
-        send_text(help_text(), HELP_MARKUP)
-    elif command == "/test":
-        send_test_alert()
-    else:
-        send_text("❓ Unknown command.\n\nUse /help.")
-
-
-def handle_callback(query):
-    chat_id = str(query.get("message", {}).get("chat", {}).get("id", ""))
-    if chat_id != str(TELEGRAM_CHAT_ID):
-        return
-    telegram_api("answerCallbackQuery", {
-        "callback_query_id": query["id"],
-        "text": "Refreshed ✓",
-    })
-    if query.get("data") == "refresh":
-        telegram_api("editMessageText", {
-            "chat_id": chat_id,
-            "message_id": query["message"]["message_id"],
-            "text": status_text(),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-            "reply_markup": json.dumps(STATUS_MARKUP),
+SIZES = [("32mm KH1", 1), ("32.5mm KL2", 2), ("34mm KL1", 3), ("34mm KB1", 4), ("29mm K01", 5)]
+AVAILABLE = {base + n: False for _, _, base in DECKS for _, n in SIZES}
+
+
+def products():
+    out = []
+    for title, handle, base in DECKS:
+        out.append({
+            "id": base,
+            "title": title,
+            "handle": handle,
+            "images": [{"src": "https://placehold.co/800x1000/1D2B53/FFF1E8/png?text=" + urllib.parse.quote(title)}],
+            "variants": [
+                {"id": base + n, "title": name, "price": "48.00", "available": AVAILABLE[base + n]}
+                for name, n in SIZES
+            ],
         })
+    return out
 
 
-def telegram_listener(offset):
-    log("Telegram listener started.")
-    last_conflict_log = 0.0
-    while True:
-        try:
-            params = {
-                "timeout": 30,
-                "allowed_updates": json.dumps(["message", "callback_query"]),
-            }
-            if offset is not None:
-                params["offset"] = offset
-
-            result = telegram_api("getUpdates", params)
-            if not result.get("ok"):
-                if "409" in str(result.get("error", "")):
-                    # another copy is still reading this bot (normal for a minute
-                    # during a redeploy). Wait quietly until it stops.
-                    if time.time() - last_conflict_log > 60:
-                        log("Another copy of this bot is still running (409). "
-                            "Waiting for it to stop. Commands resume by themselves.")
-                        last_conflict_log = time.time()
-                    time.sleep(10)
-                else:
-                    time.sleep(3)
-                continue
-
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-
-                if update.get("callback_query"):
-                    handle_callback(update["callback_query"])
-                    continue
-
-                message = update.get("message")
-                if not message:
-                    continue
-                if str(message.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
-                    continue  # only your own chat
-                text = (message.get("text") or "").strip()
-                if not text.startswith("/"):
-                    continue
-                command = text.split()[0].lower().split("@")[0]
-                log(f"Command received: {command}")
-                handle_command(command)
-
-        except Exception as e:
-            log(f"Telegram listener error: {e}")
-            time.sleep(3)
+def variant_name(vid):
+    for title, _, base in DECKS:
+        for name, n in SIZES:
+            if base + n == vid:
+                return f"{title} / {name}"
+    return f"variant {vid}"
 
 
-def setup_telegram():
-    log("Checking Telegram connection...")
-    result = telegram_api("getMe")
-    if not result.get("ok"):
-        raise RuntimeError("Telegram bot connection failed (check the token).")
-    log(f"Telegram connected: @{result['result'].get('username')}")
-
-    # long polling needs the webhook removed
-    telegram_api("deleteWebhook", {"drop_pending_updates": "false"})
-
-    commands = [
-        {"command": "status", "description": "Check current stock"},
-        {"command": "help", "description": "Show commands"},
-    ]
-    telegram_api("setMyCommands", {"commands": json.dumps(commands)})
-    log("Telegram commands configured.")
+PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title><style>body{{font-family:-apple-system,Helvetica,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;background:#10163a;color:#fff1e8}}
+a{{color:#29adff}}button,input{{font-size:16px;padding:10px;margin:4px 0}}.on{{color:#00e436}}.off{{color:#ff004d}}code{{background:#1d2b53;padding:2px 6px}}
+</style></head><body>{body}</body></html>"""
 
 
-# ============================================================
-# MAIN
-# ============================================================
+class Shop(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("[FAKE SHOP]", self.address_string(), fmt % args, flush=True)
 
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID is not set.")
+    # ---------- helpers ----------
+    def send(self, status, body, ctype="text/html; charset=utf-8", headers=None):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
 
-    log("========================================")
-    log("📡 KNIFE MFG DECK RADAR")
-    log("========================================")
-    log(f"Watching: {', '.join(SHAPES)}")
-    log(f"Check interval: {CHECK_INTERVAL:g} seconds")
-    log(f"State file: {STATE_FILE}")
+    def redirect(self, where, headers=None):
+        self.send(302, "", headers={"Location": where, **(headers or {})})
 
-    load_state()
-    load_meta()
-    refresh_fx()
-    setup_telegram()
-    offset = drop_stale_updates()
+    def has_cookie(self):
+        return "storefront_digest=ok" in self.headers.get("Cookie", "")
 
-    log("Performing initial stock check...")
-    try:
-        check_stock()
-    except Exception as e:
-        log(f"Initial check failed: {e}")
+    def page(self, title, body, status=200):
+        self.send(status, PAGE.format(title=html.escape(title), body=body))
 
-    threading.Thread(
-        target=telegram_listener, args=(offset,), daemon=True
-    ).start()
-
-    if STARTUP_PING:
+    def locked_for_me(self):
         with LOCK:
-            total = len(CURRENT_SNAPSHOT)
-            live = sum(1 for it in CURRENT_SNAPSHOT.values() if it["available"])
-        send_text(
-            "📡 <b>Deck radar online</b>\n"
-            f"{LINE}\n"
-            f"🎯 tracking {total} variants · {live} in stock\n"
-            f"⚡ checking every {CHECK_INTERVAL:g}s"
-        )
+            return STATE["locked"] and not self.has_cookie()
 
-    log("🟢 RADAR ONLINE")
+    def password_page(self, error=""):
+        with LOCK:
+            msg = STATE["message"]
+        err = f"<p class='off'>{html.escape(error)}</p>" if error else ""
+        self.page("Password", (
+            "<h1>KNIFE MFG (FAKE)</h1>"
+            f"<p>{html.escape(msg)}</p>{err}"
+            "<form method='post' action='/password'>"
+            "<input type='hidden' name='form_type' value='storefront_password'>"
+            "<label>Enter store using password</label><br>"
+            "<input type='password' name='password' autocomplete='off'><br>"
+            "<button type='submit'>Enter</button></form>"
+            "<p>Are you the store owner? <a href='/admin'>Log in here</a></p>"
+            "<footer>Powered by Shopify (not really)</footer>"
+        ))
 
-    fails = 0
-    warned = False
-    while True:
-        started = time.time()
-        refresh_fx()
-        try:
-            check_stock()
-            if warned:
-                send_text("🟢 <b>Radar is back online.</b>")
-                warned = False
-            fails = 0
-        except Exception as e:
-            fails += 1
-            log(f"Check failed ({fails} in a row): {e}")
-            if fails >= OFFLINE_AFTER and not warned:
-                send_text(
-                    "⚠️ <b>Radar can't reach the store.</b>\n"
-                    "Still trying. I'll tell you when it's back."
-                )
-                warned = True
+    # ---------- routes ----------
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path.rstrip("/") or "/"
+        query = urllib.parse.parse_qs(url.query)
 
-        # back off when the store is struggling or rate limiting
-        delay = CHECK_INTERVAL if fails == 0 else min(60, CHECK_INTERVAL * 2 ** min(fails, 4))
-        time.sleep(max(0, delay - (time.time() - started)))
+        if path == "/admin":
+            return self.admin(query)
+        if path == "/password":
+            with LOCK:
+                locked = STATE["locked"]
+            return self.password_page() if locked else self.redirect("/")
+        if self.locked_for_me():
+            return self.redirect("/password")
+
+        if path == "/products.json":
+            page = int((query.get("page") or ["1"])[0])
+            body = {"products": products() if page == 1 else []}
+            return self.send(200, json.dumps(body), "application/json")
+        if path.startswith("/cart/"):
+            ids = path.split("/cart/")[1]
+            vid = int(ids.split(":")[0]) if ids.split(":")[0].isdigit() else 0
+            fields = "".join(
+                f"<li><code>{html.escape(k)}</code> = {html.escape(v[0])}</li>" for k, v in query.items()
+            )
+            return self.page("Fake checkout", (
+                "<h1>FAKE CHECKOUT</h1>"
+                f"<p>Item: <b>{html.escape(variant_name(vid))}</b></p>"
+                f"<p>Details the link pre-filled:</p><ul>{fields or '<li>(none)</li>'}</ul>"
+                "<p>No payment is taken here. This page only proves your button works.</p>"
+            ))
+        if path.startswith("/products/"):
+            return self.page("Product", f"<h1>{html.escape(path.split('/')[-1])}</h1><p>Fake product page.</p>")
+        return self.page("Fake shop", "<h1>KNIFE MFG (FAKE)</h1><p>This is a test shop. Open /admin to control it.</p>")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "ignore"))
+        if path != "/password":
+            return self.send(404, "not found")
+        with LOCK:
+            correct = STATE["password"]
+            locked = STATE["locked"]
+        if not locked:
+            return self.redirect("/")
+        if (form.get("password") or [""])[0] == correct:
+            return self.redirect("/", {"Set-Cookie": "storefront_digest=ok; Path=/; Max-Age=86400"})
+        return self.password_page("Wrong password")
+
+    # ---------- remote control ----------
+    def admin(self, q):
+        def first(name):
+            return (q.get(name) or [""])[0]
+
+        if first("key") != ADMIN_KEY:
+            return self.page("Admin", (
+                "<h1>Remote control</h1><form><input name='key' placeholder='key'>"
+                "<button>Open</button></form>"
+            ))
+        with LOCK:
+            if first("lock"):
+                STATE["locked"] = first("lock") == "1"
+            if first("pw"):
+                STATE["password"] = first("pw")
+            if first("msg"):
+                STATE["message"] = first("msg")
+            if first("toggle").isdigit():
+                v = int(first("toggle"))
+                if v in AVAILABLE:
+                    AVAILABLE[v] = not AVAILABLE[v]
+            if first("all") in ("on", "off"):
+                for v in AVAILABLE:
+                    AVAILABLE[v] = first("all") == "on"
+        if any(first(n) for n in ("lock", "pw", "msg", "toggle", "all")):
+            return self.redirect(f"/admin?key={urllib.parse.quote(ADMIN_KEY)}")
+
+        k = urllib.parse.quote(ADMIN_KEY)
+        with LOCK:
+            locked, pw, msg = STATE["locked"], STATE["password"], STATE["message"]
+            avail = dict(AVAILABLE)
+        rows = ""
+        for title, _, base in DECKS:
+            rows += f"<h3>{html.escape(title)}</h3>"
+            for name, n in SIZES:
+                vid = base + n
+                cls, word = ("on", "IN STOCK") if avail[vid] else ("off", "sold out")
+                rows += f"<div><span class='{cls}'>{word}</span> {html.escape(name)} <a href='/admin?key={k}&toggle={vid}'>flip</a></div>"
+        self.page("Remote control", (
+            "<h1>Fake shop remote</h1>"
+            f"<p>Shop is <b>{'LOCKED' if locked else 'OPEN'}</b> · "
+            f"<a href='/admin?key={k}&lock=1'>lock</a> · <a href='/admin?key={k}&lock=0'>open</a></p>"
+            f"<p>Password: <code>{html.escape(pw)}</code></p>"
+            f"<form><input type='hidden' name='key' value='{html.escape(ADMIN_KEY)}'>"
+            "<input name='pw' placeholder='new password'><button>Set password</button></form>"
+            f"<form><input type='hidden' name='key' value='{html.escape(ADMIN_KEY)}'>"
+            f"<input name='msg' placeholder='password page message' value='{html.escape(msg)}'><button>Set message</button></form>"
+            f"<p><a href='/admin?key={k}&all=on'>everything in stock</a> · <a href='/admin?key={k}&all=off'>everything sold out</a></p>"
+            + rows
+        ))
 
 
 if __name__ == "__main__":
-    try:
-        if "--test" in sys.argv:
-            run_test_once()
-        else:
-            main()
-    except KeyboardInterrupt:
-        log("Radar stopped.")
-    except Exception as e:
-        log(f"FATAL ERROR: {e}")
-        raise
+    print(f"[FAKE SHOP] running on port {PORT}. Remote control: /admin?key={ADMIN_KEY}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", PORT), Shop).serve_forever()
