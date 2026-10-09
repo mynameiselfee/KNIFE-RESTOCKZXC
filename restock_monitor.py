@@ -282,6 +282,34 @@ def fetch_url(url, timeout=20):
         return _read(response)
 
 
+TRANSIENT_CODES = (429, 500, 502, 503, 504)
+
+
+def fetch_page_retry(url, tries=3):
+    """Like fetch_page, but if the shop is just busy for a moment (503, 429,
+    a timeout...) it tries again straight away, up to 3 times."""
+    last = None
+    for attempt in range(tries):
+        wait = 0.7 * (attempt + 1)
+        try:
+            return fetch_page(url)
+        except urllib.error.HTTPError as e:
+            if e.code not in TRANSIENT_CODES:
+                raise
+            last = e
+            try:
+                wait = float(e.headers.get("Retry-After", wait))
+            except Exception:
+                pass
+            log(f"Shop answered {e.code}, trying again")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            log(f"Shop did not answer ({e}), trying again")
+        if attempt < tries - 1:
+            time.sleep(min(wait, 5))
+    raise last
+
+
 def page_text(raw):
     """The readable message on the password page, minus Shopify boilerplate."""
     try:
@@ -310,7 +338,7 @@ def fetch_products_once():
     for page in range(1, 21):
         url = f"{SITE}/products.json?limit=250&page={page}&_={stamp}"
         try:
-            raw, final_url = fetch_page(url)
+            raw, final_url = fetch_page_retry(url)
         except Exception as e:
             raise FetchError(f"page {page}: {e}")
         if urllib.parse.urlparse(final_url).path.rstrip("/") == "/password":
@@ -1126,7 +1154,7 @@ def main():
                 warned = True
 
         # back off when the shop is struggling; a little jitter keeps the rhythm irregular
-        delay = CHECK_INTERVAL if fails == 0 else min(60, CHECK_INTERVAL * 2 ** min(fails, 4))
+        delay = CHECK_INTERVAL if fails <= 1 else min(60, CHECK_INTERVAL * 2 ** min(fails - 1, 4))
         time.sleep(max(0, delay + random.uniform(0, 0.4) - (time.time() - started)))
 
 
