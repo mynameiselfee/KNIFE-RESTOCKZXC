@@ -1,36 +1,67 @@
+"""
+KNIFE MFG DECK RADAR
+Watches knifemfg.co for KH1 / KL2 / KL1 / KB1 decks and alerts you on Telegram.
+
+Railway variables
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    required
+  CHECK_INTERVAL        seconds between checks (default 5, minimum 2)
+  LOG_EVERY             1 = log every check (default 60, about every 5 min)
+  STARTUP_PING          0 turns off the "radar online" message
+  ALERT_ON_START        0 = stay silent about decks already in stock at start-up
+  DAILY_PING_HOUR       0-23: one "still watching" message a day (off by default)
+  TZ_OFFSET_HOURS       hours from UTC for the daily ping (default 8, Singapore)
+  PASSWORD_TTL_HOURS    forget a /password after this long (default 24, 0 = never)
+  SHOP_PASSWORD         shop password that never expires (optional)
+  USD_TO_SGD            fixed exchange rate instead of the live one (optional)
+  CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
+                        ADDRESS, CITY, ZIP, COUNTRY, PHONE)
+  SHOP_URL              only for testing against a fake shop
+"""
+import gzip
 import html
 import http.cookiejar
-import urllib.error
 import json
 import os
+import random
 import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# SHOP_URL is only for testing against a fake shop. Leave it unset for the real one.
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "5")))
+LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))
 STARTUP_PING = os.getenv("STARTUP_PING", "1") == "1"
-LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))  # 1 = log every check, 60 = about every 5 min
+ALERT_ON_START = os.getenv("ALERT_ON_START", "1") == "1"
+TZ_OFFSET_HOURS = float(os.getenv("TZ_OFFSET_HOURS", "8"))
+PASSWORD_TTL = float(os.getenv("PASSWORD_TTL_HOURS", "24")) * 3600
+
+_daily = os.getenv("DAILY_PING_HOUR", "").strip()
+DAILY_PING_HOUR = int(_daily) if _daily.isdigit() and 0 <= int(_daily) <= 23 else None
+
 OFFLINE_AFTER = 6            # failed checks in a row before a warning
 MAX_ALERTS_PER_DROP = 4      # photo alerts per check, the rest go in one list
+SEND_RETRY_WAITS = (0, 2, 4, 8, 12)   # seconds to wait before each send attempt
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; KnifeMFG-DeckRadar/1.1)",
+    "User-Agent": "Mozilla/5.0 (compatible; KnifeMFG-DeckRadar/2.0)",
     "Accept": "application/json,text/plain,*/*",
+    "Accept-Encoding": "gzip",
     "Cache-Control": "no-cache",
 }
 
@@ -41,63 +72,72 @@ def log(message):
     print(f"[RADAR] {message}", flush=True)
 
 
+def esc(text):
+    return html.escape(str(text or ""))
+
+
 # ============================================================
-# STATE FILE
-# Uses /data (Railway volume) when it is writable, otherwise
-# falls back to a local file so the radar never crashes.
+# MEMORY (state file)
 # ============================================================
 
 def pick_state_file():
-    testing = bool(os.getenv("SHOP_URL"))   # a fake shop gets its own memory
-    wanted = os.getenv("STATE_FILE", "/data/state_test.json" if testing else "/data/state.json")
+    """(path, persistent). On Railway the memory only survives deploys if
+    a Volume is mounted at /data."""
+    testing = bool(os.getenv("SHOP_URL"))      # a fake shop gets its own memory
+    default = "/data/state_test.json" if testing else "/data/state.json"
+    wanted = os.getenv("STATE_FILE", default)
+    folder = os.path.dirname(wanted) or "."
     try:
-        os.makedirs(os.path.dirname(wanted) or ".", exist_ok=True)
+        os.makedirs(folder, exist_ok=True)
         probe = wanted + ".probe"
         with open(probe, "w") as f:
             f.write("ok")
         os.remove(probe)
-        return wanted
+        persistent = bool(os.getenv("STATE_FILE")) or os.path.ismount(folder)
+        return wanted, persistent
     except Exception as e:
-        log(f"State path {wanted} is not writable ({e}). Using ./state.json")
-        log("Add a Railway Volume mounted at /data to keep state between deploys.")
-        return "state_test.json" if testing else "state.json"
+        log(f"State path {wanted} is not writable ({e}). Using a local file.")
+        return ("state_test.json" if testing else "state.json"), False
 
 
-STATE_FILE = pick_state_file()
-
-STATE = {}                 # variant_id -> was in stock (bool)
-CURRENT_SNAPSHOT = {}      # variant_id -> item dict
-LOCK = threading.Lock()
-
-# ---- USD -> SGD (the shop's base prices are in USD) ----
-# Set USD_TO_SGD on Railway to pin a fixed rate instead of the live one.
-FX_FIXED = bool(os.getenv("USD_TO_SGD"))
-FX = {"rate": float(os.getenv("USD_TO_SGD", "1.29")), "t": 0.0}
-FX_SOURCES = [
-    ("https://api.frankfurter.app/latest?from=USD&to=SGD", lambda d: d["rates"]["SGD"]),
-    ("https://open.er-api.com/v6/latest/USD", lambda d: d["rates"]["SGD"]),
-]
-
-
-def refresh_fx():
-    """Update the rate at most every 6 hours. Never raises."""
-    if FX_FIXED or time.time() - FX["t"] < 6 * 3600:
-        return
-    for url, pick in FX_SOURCES:
-        try:
-            rate = float(pick(json.loads(fetch_url(url, timeout=8).decode("utf-8"))))
-            if 0.5 < rate < 3:
-                FX["rate"], FX["t"] = rate, time.time()
-                log(f"USD to SGD rate: {rate:.4f}")
-                return
-        except Exception as e:
-            log(f"Rate source failed: {e}")
-    FX["t"] = time.time() - 6 * 3600 + 600  # try again in 10 minutes
-
-LAST_CHECK = 0.0           # when the store was last read successfully
-STARTED = time.time()
+STATE_FILE, MEMORY_OK = pick_state_file()
 META_FILE = STATE_FILE + ".meta"
-META = {"last_drop": None, "shop_password": ""}  # last_drop: {"t", "shapes", "product"}
+
+STATE = {}               # variant_id -> was in stock when last alerted/seen
+CURRENT_SNAPSHOT = {}    # variant_id -> item dict
+DATA_LOCK = threading.Lock()
+LAST_CHECK = 0.0         # when the shop was last read successfully
+META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": ""}
+
+
+def _write_json(path, data):
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(temp, path)
+
+
+def load_state():
+    global STATE
+    try:
+        if not os.path.exists(STATE_FILE):
+            STATE = {}
+            log("No previous memory found.")
+            return
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        STATE = {k: bool(v) for k, v in raw.items() if isinstance(v, bool)}
+        log(f"Loaded memory: {len(STATE)} variants")
+    except Exception as e:
+        log(f"Could not load memory: {e}")
+        STATE = {}
+
+
+def save_state():
+    try:
+        _write_json(STATE_FILE, STATE)
+    except Exception as e:
+        log(f"Could not save memory: {e}")
 
 
 def load_meta():
@@ -111,28 +151,53 @@ def load_meta():
 
 def save_meta():
     try:
-        temp = META_FILE + ".tmp"
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump(META, f)
-        os.replace(temp, META_FILE)
+        _write_json(META_FILE, META)
     except Exception as e:
         log(f"Could not save meta: {e}")
 
 
-def remember_drop(items):
-    first = group_by_deck(items)[0]
-    META["last_drop"] = {
-        "t": time.time(),
-        "shapes": [it["shape"] for it in first],
-        "product": first[0]["product"],
-    }
-    save_meta()
+# ============================================================
+# PRICES: USD -> SGD
+# ============================================================
+
+FX_FIXED = bool(os.getenv("USD_TO_SGD"))
+FX = {"rate": float(os.getenv("USD_TO_SGD", "1.29")), "t": 0.0}
+FX_SOURCES = [
+    ("https://api.frankfurter.app/latest?from=USD&to=SGD", lambda d: d["rates"]["SGD"]),
+    ("https://open.er-api.com/v6/latest/USD", lambda d: d["rates"]["SGD"]),
+]
 
 
-# ---- Quick checkout ----
-# The button opens the shop's own checkout with the deck already in it.
-# Optional Railway variables pre-fill your details so checkout is one tap
-# (then pay with Apple Pay / Shop Pay). Nothing is ever paid by the bot.
+def refresh_fx():
+    """Updates the rate at most every 6 hours. Never raises."""
+    if FX_FIXED or time.time() - FX["t"] < 6 * 3600:
+        return
+    for url, pick in FX_SOURCES:
+        try:
+            rate = float(pick(json.loads(fetch_url(url, timeout=8).decode("utf-8"))))
+            if 0.5 < rate < 3:
+                FX["rate"], FX["t"] = rate, time.time()
+                log(f"USD to SGD rate: {rate:.4f}")
+                return
+        except Exception as e:
+            log(f"Rate source failed: {e}")
+    FX["t"] = time.time() - 6 * 3600 + 600   # try again in 10 minutes
+
+
+def money(price):
+    """Shop price (USD) shown as approximate Singapore dollars."""
+    try:
+        return f"~S${float(price) * FX['rate']:.0f}"
+    except Exception:
+        return ""
+
+
+# ============================================================
+# CHECKOUT LINKS
+# Nothing is ever paid by the bot. These open the shop's own
+# checkout, optionally pre-filled from your Railway variables.
+# ============================================================
+
 CHECKOUT_FIELDS = {
     "CHECKOUT_EMAIL": "checkout[email]",
     "CHECKOUT_FIRST_NAME": "checkout[shipping_address][first_name]",
@@ -146,21 +211,21 @@ CHECKOUT_FIELDS = {
 
 
 def checkout_url(variant_id):
-    base = f"{SITE}/cart/{variant_id}:1"
     params = {
         field: os.getenv(var, "").strip()
         for var, field in CHECKOUT_FIELDS.items()
         if os.getenv(var, "").strip()
     }
-    return base + ("?" + urllib.parse.urlencode(params) if params else "")
+    return f"{SITE}/cart/{variant_id}:1" + ("?" + urllib.parse.urlencode(params) if params else "")
 
 
-def esc(text):
-    return html.escape(str(text or ""))
+def cart_page_url(variant_id):
+    """Backup link: lands on the shop's normal cart page."""
+    return f"{SITE}/cart/{variant_id}:1?storefront=true"
 
 
 # ============================================================
-# FETCH
+# READING THE SHOP
 # ============================================================
 
 class FetchError(Exception):
@@ -173,6 +238,48 @@ class ShopLocked(FetchError):
     def __init__(self, message, text=""):
         super().__init__(message)
         self.text = text
+
+
+SHOP_LOCKED = False
+COOKIES = http.cookiejar.CookieJar()
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIES))
+
+
+def _read(response):
+    raw = response.read()
+    if response.headers.get("Content-Encoding", "").lower() == "gzip":
+        raw = gzip.decompress(raw)
+    return raw
+
+
+def fetch_page(url, timeout=20):
+    """(bytes, final_url). A redirect to /password shows in the final URL."""
+    request = urllib.request.Request(url, headers=HEADERS)
+    with OPENER.open(request, timeout=timeout) as response:
+        return _read(response), response.geturl()
+
+
+def post_password(password, timeout=20):
+    """Submits the shop's password form. Returns (bytes, final_url)."""
+    data = urllib.parse.urlencode({
+        "form_type": "storefront_password",
+        "utf8": "✓",
+        "password": password,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{SITE}/password",
+        data=data,
+        headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with OPENER.open(request, timeout=timeout) as response:
+        return _read(response), response.geturl()
+
+
+def fetch_url(url, timeout=20):
+    request = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return _read(response)
 
 
 def page_text(raw):
@@ -196,99 +303,10 @@ def page_text(raw):
     return " · ".join(keep)[:300]
 
 
-SHOP_LOCKED = False
-
-
-COOKIES = http.cookiejar.CookieJar()
-OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIES))
-
-
-def fetch_page(url, timeout=20):
-    """(bytes, final_url): the final URL shows a redirect to /password."""
-    request = urllib.request.Request(url, headers=HEADERS)
-    with OPENER.open(request, timeout=timeout) as response:
-        return response.read(), response.geturl()
-
-
-def post_password(password, timeout=20):
-    """Submits the shop's storefront password form. Returns (bytes, final_url)."""
-    data = urllib.parse.urlencode({
-        "form_type": "storefront_password",
-        "utf8": "✓",
-        "password": password,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        f"{SITE}/password",
-        data=data,
-        headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    with OPENER.open(request, timeout=timeout) as response:
-        return response.read(), response.geturl()
-
-
-def fetch_url(url, timeout=20):
-    request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
-
-
-PW = {"bad": None, "last_try": 0.0, "using": False}
-
-
-def shop_password():
-    return META.get("shop_password") or os.getenv("SHOP_PASSWORD", "")
-
-
-def try_unlock():
-    """Logs in with the password you gave me. Never guesses, and never
-    retries a password the shop already rejected."""
-    password = shop_password()
-    if not password or password == PW["bad"]:
-        return False
-    if time.time() - PW["last_try"] < 20:
-        return False
-    PW["last_try"] = time.time()
-    try:
-        body, final_url = post_password(password)
-    except Exception as e:
-        log(f"Password login failed: {e}")
-        return False
-    accepted = (
-        urllib.parse.urlparse(final_url).path.rstrip("/") != "/password"
-        and b'type="password"' not in body[:300000]
-    )
-    if accepted:
-        log("Shop password accepted.")
-        PW["bad"] = None
-        PW["using"] = True
-        return True
-    PW["bad"] = password
-    PW["using"] = False
-    log("The shop rejected the password.")
-    send_text(
-        "❌ <b>The shop rejected that password.</b>\n"
-        "Send /password followed by the right one."
-    )
-    return False
-
-
-def fetch_products():
-    """Reads the shop. If it is locked and you gave me the password,
-    logs in with it and reads again."""
-    try:
-        return fetch_products_once()
-    except ShopLocked:
-        PW["using"] = False
-        if try_unlock():
-            return fetch_products_once()
-        raise
-
-
 def fetch_products_once():
     """All products, or raises FetchError. Never returns a partial list."""
     products = []
-    stamp = int(time.time() * 1000)  # cache buster for the store's CDN
+    stamp = int(time.time() * 1000)   # cache buster for the shop's CDN
     for page in range(1, 21):
         url = f"{SITE}/products.json?limit=250&page={page}&_={stamp}"
         try:
@@ -312,9 +330,17 @@ def fetch_products_once():
     return products
 
 
-# ============================================================
-# SNAPSHOT
-# ============================================================
+def fetch_products():
+    """Reads the shop. If it is locked and you gave me the password,
+    logs in with it and reads again."""
+    try:
+        return fetch_products_once()
+    except ShopLocked:
+        PW["using"] = False
+        if try_unlock():
+            return fetch_products_once()
+        raise
+
 
 def extract_shape(title):
     """Whole-word match, so KL1 never matches KL10 or XKL1."""
@@ -336,32 +362,83 @@ def build_snapshot(products):
 
         for variant in product.get("variants", []):
             vid = str(variant.get("id", ""))
-            if not vid:
-                continue
             shape = extract_shape(variant.get("title", ""))
-            if not shape:
+            if not vid or not shape:
                 continue
             title = variant.get("title", "")
-            size = re.sub(rf"\b{shape}\b", "", title, flags=re.I).strip(" -/·")
             snapshot[vid] = {
                 "id": vid,
                 "product": name,
                 "handle": handle or name,
                 "variant": title,
-                "size": size,
+                "size": re.sub(rf"\b{shape}\b", "", title, flags=re.I).strip(" -/·"),
                 "shape": shape,
                 "price": variant.get("price", ""),
                 "available": bool(variant.get("available", False)),
                 "image": image,
                 "product_url": base_url,
-                "variant_url": f"{base_url}?variant={vid}",
                 "cart_url": checkout_url(vid),
+                "cart_page_url": cart_page_url(vid),
             }
     return snapshot
 
 
 # ============================================================
-# TELEGRAM API
+# SHOP PASSWORD (you give it to me with /password)
+# ============================================================
+
+PW = {"bad": None, "last_try": 0.0, "using": False}
+
+
+def shop_password():
+    return META.get("shop_password") or os.getenv("SHOP_PASSWORD", "")
+
+
+def expire_password():
+    """Forgets a /password after PASSWORD_TTL so an old one never lingers."""
+    if not META.get("shop_password") or PASSWORD_TTL <= 0:
+        return
+    if time.time() - float(META.get("shop_password_t") or 0) > PASSWORD_TTL:
+        META["shop_password"] = ""
+        save_meta()
+        PW.update(bad=None, using=False)
+        log("Saved shop password expired and was removed.")
+        send_text("🔑 The saved shop password expired and was removed.\nSend /password again if you still need it.")
+
+
+def try_unlock():
+    """Logs in with the password you gave me. Never guesses, and never
+    retries a password the shop already rejected."""
+    password = shop_password()
+    if not password or password == PW["bad"]:
+        return False
+    if time.time() - PW["last_try"] < 20:
+        return False
+    PW["last_try"] = time.time()
+    try:
+        body, final_url = post_password(password)
+    except Exception as e:
+        log(f"Password login failed: {e}")
+        return False
+    accepted = (
+        urllib.parse.urlparse(final_url).path.rstrip("/") != "/password"
+        and b'type="password"' not in body[:300000]
+    )
+    if accepted:
+        log("Shop password accepted.")
+        PW.update(bad=None, using=True)
+        return True
+    PW.update(bad=password, using=False)
+    log("The shop rejected the password.")
+    send_text(
+        "❌ <b>The shop rejected that password.</b>\n"
+        "Send /password followed by the right one."
+    )
+    return False
+
+
+# ============================================================
+# TELEGRAM
 # ============================================================
 
 def telegram_api(method, params=None, _retry=True):
@@ -369,10 +446,9 @@ def telegram_api(method, params=None, _retry=True):
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    encoded = urllib.parse.urlencode(params or {}).encode("utf-8")
     request = urllib.request.Request(
         url,
-        data=encoded,
+        data=urllib.parse.urlencode(params or {}).encode("utf-8"),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
@@ -429,10 +505,23 @@ def send_photo(photo, caption, reply_markup=None):
     return telegram_api("sendPhoto", params)
 
 
+def deliver(send, waits=None):
+    """Runs send() until Telegram accepts it. True only if it was delivered."""
+    for i, wait in enumerate(SEND_RETRY_WAITS if waits is None else waits):
+        if wait:
+            time.sleep(wait)
+        try:
+            if send().get("ok"):
+                return True
+        except Exception as e:
+            log(f"Send attempt {i + 1} failed: {e}")
+    return False
+
+
 # ============================================================
 # ALERTS
-# One alert per DECK. If several shapes restock together they
-# share one photo and get one BUY button each.
+# One alert per DECK: several shapes that restock together share
+# one photo and get one quick checkout button each.
 # ============================================================
 
 def group_by_deck(items):
@@ -448,8 +537,6 @@ def group_by_deck(items):
 
 
 def alert_caption(group, test=False):
-    """Same look as the original alert: photo on top, then
-    TEST ALERT / DECK IN STOCK, name, shape, price, buttons."""
     head = "🧪 <b>TEST ALERT</b>" if test else "🟢 <b>DECK IN STOCK</b>"
     prices = {money(it["price"]) for it in group}
     one_price = len(prices) == 1 and "" not in prices
@@ -475,19 +562,18 @@ def alert_caption(group, test=False):
 
 def alert_buttons(group):
     if len(group) == 1:
-        return {"inline_keyboard": [[
-            {"text": "⚡ Quick checkout", "url": group[0]["cart_url"]},
-            {"text": "🔗 Open page", "url": group[0]["product_url"]},
-        ]]}
-    buy = [
-        {"text": f"⚡ {it['shape']}", "url": it["cart_url"]}
-        for it in group
-    ]
-    view = [{"text": "🔗 Open page", "url": group[0]["product_url"]}]
-    return {"inline_keyboard": [buy, view]}
+        it = group[0]
+        return {"inline_keyboard": [
+            [{"text": "⚡ Quick checkout", "url": it["cart_url"]},
+             {"text": "🛒 Cart page", "url": it["cart_page_url"]}],
+            [{"text": "🔗 Open page", "url": it["product_url"]}],
+        ]}
+    buy = [{"text": f"⚡ {it['shape']}", "url": it["cart_url"]} for it in group]
+    return {"inline_keyboard": [buy, [{"text": "🔗 Open page", "url": group[0]["product_url"]}]]}
 
 
 def send_alert(group, test=False):
+    """True once Telegram has accepted the alert (photo, or text if the photo fails)."""
     log(
         ("TEST ALERT: " if test else "RESTOCK DETECTED: ")
         + f"{group[0]['product']} ({', '.join(it['shape'] for it in group)})"
@@ -496,31 +582,72 @@ def send_alert(group, test=False):
     markup = alert_buttons(group)
     image = group[0].get("image")
 
-    if image:
-        if send_photo(image, caption, markup).get("ok"):
-            return
-    # Fallback: same message as text, buttons kept
-    send_text(caption, markup)
+    def attempt():
+        if image:
+            result = send_photo(image, caption, markup)
+            if result.get("ok"):
+                return result
+        return send_text(caption, markup)
+
+    return deliver(attempt)
 
 
 def send_alerts(items):
+    """Sends the alerts and returns the variant ids Telegram accepted."""
     groups = group_by_deck(items)
-    for group in groups[:MAX_ALERTS_PER_DROP]:
-        send_alert(group)
-    rest = groups[MAX_ALERTS_PER_DROP:]
+    shown, rest = groups[:MAX_ALERTS_PER_DROP], groups[MAX_ALERTS_PER_DROP:]
+    delivered = set()
+
+    if shown:
+        with ThreadPoolExecutor(max_workers=len(shown)) as pool:
+            results = list(pool.map(send_alert, shown))
+        for group, ok in zip(shown, results):
+            if ok:
+                delivered.update(it["id"] for it in group)
+
     if rest:
         lines = ["🟢 <b>MORE DECKS IN STOCK</b>", LINE]
         for group in rest:
             shapes = " ".join(it["shape"] for it in group)
             lines.append(f"• <b>{esc(shapes)}</b> {esc(group[0]['product'])}")
-        send_text(
-            "\n".join(lines),
-            {"inline_keyboard": [[{"text": "🔗 Open shop", "url": SITE}]]},
-        )
+        markup = {"inline_keyboard": [[{"text": "🔗 Open shop", "url": SITE}]]}
+        if deliver(lambda: send_text("\n".join(lines), markup)):
+            for group in rest:
+                delivered.update(it["id"] for it in group)
+    return delivered
+
+
+def send_test_alerts(items):
+    """Real alert layout with a TEST header, for every deck in stock now."""
+    if not items:
+        send_text("⏳ No data yet, try again in a few seconds.")
+        return
+    live = [it for it in items if it["available"]]
+    if not live:
+        send_text("🧪 <b>TEST</b> · nothing is in stock right now.\nHere is a sample so you can see the look:")
+        first = items[0]
+        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
+        return
+    groups = group_by_deck(live)
+    send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
+    for group in groups[:MAX_ALERTS_PER_DROP]:
+        send_alert(group, test=True)
+    if len(groups) > MAX_ALERTS_PER_DROP:
+        send_text(f"🧪 +{len(groups) - MAX_ALERTS_PER_DROP} more deck(s) in stock, not shown.")
+
+
+def remember_drop(items):
+    first = group_by_deck(items)[0]
+    META["last_drop"] = {
+        "t": time.time(),
+        "shapes": [it["shape"] for it in first],
+        "product": first[0]["product"],
+    }
+    save_meta()
 
 
 # ============================================================
-# /STATUS and /HELP
+# /status, /help and the daily message
 # ============================================================
 
 def ago(seconds):
@@ -536,24 +663,18 @@ def ago(seconds):
     return f"{hours // 24}d ago"
 
 
-def money(price):
-    """Shop price (USD) shown as approximate Singapore dollars."""
-    try:
-        return f"~S${float(price) * FX['rate']:.0f}"
-    except Exception:
-        return ""
-
-
-STATUS_MARKUP = {
-    "inline_keyboard": [[
-        {"text": "🔄 Refresh", "callback_data": "refresh"},
-        {"text": "🛒 Open shop", "url": SITE},
-    ]]
-}
+STATUS_MARKUP = {"inline_keyboard": [[
+    {"text": "🔄 Refresh", "callback_data": "refresh"},
+    {"text": "🛒 Open shop", "url": SITE},
+]]}
+HELP_MARKUP = {"inline_keyboard": [[
+    {"text": "📡 Status", "callback_data": "refresh"},
+    {"text": "🛒 Open shop", "url": SITE},
+]]}
 
 
 def status_text():
-    with LOCK:
+    with DATA_LOCK:
         snapshot = dict(CURRENT_SNAPSHOT)
         last_check = LAST_CHECK
         last_drop = META.get("last_drop")
@@ -563,22 +684,17 @@ def status_text():
     if SHOP_LOCKED:
         hint = "🔑 password saved" if shop_password() else "🔑 got the password? send /password"
         return "\n".join(head + ["🔒 shop is behind a password", "⚡ watching for it to open", hint])
-
     if not snapshot:
         return "\n".join(head + ["⏳ warming up, try again in a few seconds"])
 
     lines = list(head)
     for shape in SHAPES:
-        live = [
-            it for it in snapshot.values()
-            if it["shape"] == shape and it["available"]
-        ]
+        live = [it for it in snapshot.values() if it["shape"] == shape and it["available"]]
         if live:
             lines.append(f"🟢 <b>{shape}</b> · {len(live)} in stock")
             for it in live[:5]:
                 price = money(it["price"])
-                tail = f" · {price}" if price else ""
-                lines.append(f"      ▸ {esc(it['product'])}{tail}")
+                lines.append(f"      ▸ {esc(it['product'])}" + (f" · {price}" if price else ""))
             if len(live) > 5:
                 lines.append(f"      ▸ +{len(live) - 5} more")
         else:
@@ -591,9 +707,9 @@ def status_text():
     else:
         lines.append(f"🕒 checked {ago(age)} · every {CHECK_INTERVAL:g}s")
     if last_drop:
-        what = " ".join(last_drop["shapes"])
         lines.append(
-            f"🎯 last drop · {what} {esc(last_drop['product'])} · {ago(time.time() - last_drop['t'])}"
+            f"🎯 last drop · {' '.join(last_drop['shapes'])} {esc(last_drop['product'])}"
+            f" · {ago(time.time() - last_drop['t'])}"
         )
     return "\n".join(lines)
 
@@ -616,106 +732,42 @@ def help_text():
     )
 
 
-HELP_MARKUP = {
-    "inline_keyboard": [[
-        {"text": "📡 Status", "callback_data": "refresh"},
-        {"text": "🛒 Open shop", "url": SITE},
-    ]]
-}
-
-
-def send_test_alerts(items):
-    """Sends the real alert layout (TEST header) for every deck that is
-    in stock right now. If nothing is in stock, sends one sample."""
-    if not items:
-        send_text("⏳ No data yet, try again in a few seconds.")
+def maybe_daily_ping():
+    """One 'still watching' message a day, so silence means something is wrong."""
+    if DAILY_PING_HOUR is None:
         return
-
-    live = [it for it in items if it["available"]]
-    if not live:
-        send_text(
-            "🧪 <b>TEST</b> · nothing is in stock right now.\n"
-            "Here is a sample so you can see the look:"
-        )
-        first = items[0]
-        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
+    now = datetime.now(timezone(timedelta(hours=TZ_OFFSET_HOURS)))
+    today = now.strftime("%Y-%m-%d")
+    if now.hour != DAILY_PING_HOUR or META.get("last_daily") == today:
         return
-
-    groups = group_by_deck(live)
-    send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
-    for group in groups[:MAX_ALERTS_PER_DROP]:
-        send_alert(group, test=True)
-    if len(groups) > MAX_ALERTS_PER_DROP:
-        send_text(f"🧪 +{len(groups) - MAX_ALERTS_PER_DROP} more deck(s) in stock, not shown.")
-
-
-def send_test_alert():
-    """Hidden command: /test"""
-    with LOCK:
-        items = list(CURRENT_SNAPSHOT.values())
-    send_test_alerts(items)
-
-
-def run_test_once():
-    """python restock_monitor.py --test
-    Reads the shop once, sends test alerts for the decks in stock, then exits.
-    Safe to run while the radar is online: it only sends messages."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
-    refresh_fx()
-    items = list(build_snapshot(fetch_products()).values())
-    log(f"Test: {len(items)} tracked variants, {sum(1 for i in items if i['available'])} in stock")
-    send_test_alerts(items)
-    log("Test alerts sent.")
+    META["last_daily"] = today
+    save_meta()
+    with DATA_LOCK:
+        total = len(CURRENT_SNAPSHOT)
+        live = sum(1 for it in CURRENT_SNAPSHOT.values() if it["available"])
+    send_text(
+        "💚 <b>Still watching</b>\n"
+        f"{LINE}\n"
+        f"🎯 {total} variants · {live} in stock\n"
+        f"🕒 checking every {CHECK_INTERVAL:g}s"
+    )
 
 
 # ============================================================
-# STATE LOAD / SAVE
-# ============================================================
-
-def load_state():
-    global STATE
-    try:
-        if not os.path.exists(STATE_FILE):
-            STATE = {}
-            log("No previous state found.")
-            return
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        # accepts {"id": true/false} (this script) and ignores other formats
-        STATE = {k: bool(v) for k, v in raw.items() if isinstance(v, bool)}
-        log(f"Loaded state: {len(STATE)} variants")
-    except Exception as e:
-        log(f"Could not load state: {e}")
-        STATE = {}
-
-
-def save_state():
-    try:
-        temp = STATE_FILE + ".tmp"
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump(STATE, f)
-        os.replace(temp, STATE_FILE)
-    except Exception as e:
-        log(f"Could not save state: {e}")
-
-
-# ============================================================
-# STOCK CHECK
-# Raises FetchError on any problem, so the snapshot and state
-# are never replaced by half-fetched data.
+# THE STOCK CHECK
+# Raises FetchError on any problem, so the snapshot and the memory
+# are never replaced by half-read data. A deck is only marked "seen"
+# once Telegram has accepted its alert, so an alert can't be lost.
 # ============================================================
 
 _last_available = None
 _quiet_checks = 0
-
-
 LOCK_TEXT = {"last": ""}
 
 
 def note_locked(text=""):
-    """Tell the user once per lock period, then keep watching quietly.
-    If the owner edits the password page message, tell them again."""
+    """Tells you once per lock period, then keeps watching quietly.
+    If the owner edits the password page message, tells you again."""
     global SHOP_LOCKED
     text = (text or "").strip()
     if SHOP_LOCKED:
@@ -726,11 +778,7 @@ def note_locked(text=""):
     SHOP_LOCKED = True
     LOCK_TEXT["last"] = text
     log("The shop is behind a password page. Watching for it to open.")
-    lines = [
-        "🔒 <b>Shop is behind a password</b>",
-        LINE,
-        "I can't see the products yet.",
-    ]
+    lines = ["🔒 <b>Shop is behind a password</b>", LINE, "I can't see the products yet."]
     if text:
         lines.append(f"📝 The page says: <i>{esc(text)}</i>")
     lines.append("⚡ Still watching. You'll get an alert the moment it opens.")
@@ -748,19 +796,23 @@ def check_stock():
     if not snapshot:
         raise FetchError("no tracked shapes in the feed")
 
-    alerts = []
-    changed = False
+    with DATA_LOCK:
+        reopened = SHOP_LOCKED                 # was behind the password until now
+        fresh_memory = not STATE
+        # decks in stock now that weren't when we last looked
+        wanted = [it for key, it in snapshot.items() if it["available"] and not STATE.get(key, False)]
+        if reopened:
+            wanted = [it for it in snapshot.values() if it["available"]]
+        elif fresh_memory and not ALERT_ON_START:
+            wanted = []
+        pending = {it["id"] for it in wanted}
 
-    with LOCK:
-        reopened = SHOP_LOCKED          # was behind the password until now
-        first_run = not STATE and not reopened
+        changed = False
         for key, item in snapshot.items():
-            now = item["available"]
-            was = STATE.get(key, False)
-            if not first_run and now and not was:
-                alerts.append(item)
-            if STATE.get(key) != now:
-                STATE[key] = now
+            if key in pending:
+                continue                       # remembered only after the alert is delivered
+            if STATE.get(key) != item["available"]:
+                STATE[key] = item["available"]
                 changed = True
         CURRENT_SNAPSHOT = snapshot
         LAST_CHECK = time.time()
@@ -770,9 +822,8 @@ def check_stock():
     available = sum(1 for it in snapshot.values() if it["available"])
 
     if reopened:
-        alerts = [it for it in snapshot.values() if it["available"]]
         SHOP_LOCKED = False
-        shop_button = {"inline_keyboard": [[{"text": "🛒 Open shop", "url": SITE}]]}
+        button = {"inline_keyboard": [[{"text": "🛒 Open shop", "url": SITE}]]}
         if PW["using"]:
             log("Inside the shop with your password")
             send_text(
@@ -780,7 +831,7 @@ def check_stock():
                 f"{LINE}\n"
                 "Your password worked. It may still be locked for everyone else, "
                 "but I can see the products and I'm watching stock.",
-                shop_button,
+                button,
             )
         else:
             log("The shop password is gone: the shop is OPEN")
@@ -789,16 +840,22 @@ def check_stock():
                 f"{LINE}\n"
                 "The password page is gone.\n"
                 "⚡ Checking stock now...",
-                shop_button,
+                button,
             )
+    elif fresh_memory:
+        log(f"Memory was empty: {len(snapshot)} variants, {available} in stock")
 
-    if first_run:
-        log(f"Baseline created: {len(snapshot)} variants, {available} in stock")
-        return
-
-    if alerts:
-        remember_drop(alerts)
-        send_alerts(alerts)
+    if wanted:
+        delivered = send_alerts(wanted)
+        with DATA_LOCK:
+            for vid in delivered:
+                STATE[vid] = True
+            save_state()
+        if delivered:
+            remember_drop([it for it in wanted if it["id"] in delivered])
+        missed = len(pending - delivered)
+        if missed:
+            log(f"{missed} alert(s) could not be delivered. Retrying on the next check.")
 
     # quiet by default: only when something changes, or every LOG_EVERY checks
     _quiet_checks += 1
@@ -808,24 +865,34 @@ def check_stock():
         _quiet_checks = 0
 
 
+def run_test_once():
+    """python restock_monitor.py --test
+    Reads the shop once, sends test alerts for the decks in stock, then exits.
+    Safe to run while the radar is online: it only sends messages."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
+    refresh_fx()
+    items = list(build_snapshot(fetch_products()).values())
+    log(f"Test: {len(items)} tracked variants, {sum(1 for i in items if i['available'])} in stock")
+    send_test_alerts(items)
+    log("Test alerts sent.")
+
+
 # ============================================================
-# TELEGRAM LISTENER
+# TELEGRAM COMMANDS
 # ============================================================
 
 def drop_stale_updates():
-    """Skip commands sent while the radar was off, so a restart
+    """Skips commands sent while the radar was off, so a restart
     never replays old /status or /test messages."""
     result = telegram_api("getUpdates", {"offset": -1, "timeout": 0})
     updates = result.get("result", []) if result.get("ok") else []
-    if updates:
-        return updates[-1]["update_id"] + 1
-    return None
+    return updates[-1]["update_id"] + 1 if updates else None
 
 
 def handle_password(chat_id, message_id, argument):
     """/password <word> saves it and tries it. /password clear removes it."""
-    # delete the user's message so the password doesn't sit in the chat
-    telegram_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    telegram_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})  # keep it out of the chat
     argument = argument.strip()
 
     if not argument:
@@ -843,14 +910,25 @@ def handle_password(chat_id, message_id, argument):
         return
 
     META["shop_password"] = argument
+    META["shop_password_t"] = time.time()
     save_meta()
     PW.update(bad=None, last_try=0.0)
     masked = argument if len(argument) <= 2 else argument[0] + "•" * (len(argument) - 2) + argument[-1]
     if SHOP_LOCKED:
         send_text(f"🔑 Got it: <code>{esc(masked)}</code> ({len(argument)} characters). Trying it on the shop now...")
-        try_unlock()   # says so itself if the shop rejects it; a success is announced by the next check
+        try_unlock()    # says so itself if rejected; a success is announced by the next check
     else:
-        send_text(f"🔑 Saved: <code>{esc(masked)}</code> ({len(argument)} characters). The shop isn't locked right now, I'll use it when it is.")
+        send_text(
+            f"🔑 Saved: <code>{esc(masked)}</code> ({len(argument)} characters). "
+            "The shop isn't locked right now, I'll use it when it is."
+        )
+
+
+def send_test_alert():
+    """Hidden command: /test"""
+    with DATA_LOCK:
+        items = list(CURRENT_SNAPSHOT.values())
+    send_test_alerts(items)
 
 
 def handle_command(command):
@@ -868,10 +946,7 @@ def handle_callback(query):
     chat_id = str(query.get("message", {}).get("chat", {}).get("id", ""))
     if chat_id != str(TELEGRAM_CHAT_ID):
         return
-    telegram_api("answerCallbackQuery", {
-        "callback_query_id": query["id"],
-        "text": "Refreshed ✓",
-    })
+    telegram_api("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Refreshed ✓"})
     if query.get("data") == "refresh":
         telegram_api("editMessageText", {
             "chat_id": chat_id,
@@ -888,10 +963,7 @@ def telegram_listener(offset):
     last_conflict_log = 0.0
     while True:
         try:
-            params = {
-                "timeout": 30,
-                "allowed_updates": json.dumps(["message", "callback_query"]),
-            }
+            params = {"timeout": 30, "allowed_updates": json.dumps(["message", "callback_query"])}
             if offset is not None:
                 params["offset"] = offset
 
@@ -917,10 +989,8 @@ def telegram_listener(offset):
                     continue
 
                 message = update.get("message")
-                if not message:
-                    continue
-                if str(message.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
-                    continue  # only your own chat
+                if not message or str(message.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
+                    continue                    # only your own chat
                 text = (message.get("text") or "").strip()
                 if not text.startswith("/"):
                     continue
@@ -928,12 +998,10 @@ def telegram_listener(offset):
                 log(f"Command received: {command}")
                 if command == "/password":
                     parts = text.split(None, 1)
-                    handle_password(
-                        message["chat"]["id"], message["message_id"],
-                        parts[1] if len(parts) > 1 else "",
-                    )
-                    continue
-                handle_command(command)
+                    handle_password(message["chat"]["id"], message["message_id"],
+                                    parts[1] if len(parts) > 1 else "")
+                else:
+                    handle_command(command)
 
         except Exception as e:
             log(f"Telegram listener error: {e}")
@@ -946,15 +1014,11 @@ def setup_telegram():
     if not result.get("ok"):
         raise RuntimeError("Telegram bot connection failed (check the token).")
     log(f"Telegram connected: @{result['result'].get('username')}")
-
-    # long polling needs the webhook removed
-    telegram_api("deleteWebhook", {"drop_pending_updates": "false"})
-
-    commands = [
+    telegram_api("deleteWebhook", {"drop_pending_updates": "false"})   # long polling needs it off
+    telegram_api("setMyCommands", {"commands": json.dumps([
         {"command": "status", "description": "Check current stock"},
         {"command": "help", "description": "Show commands"},
-    ]
-    telegram_api("setMyCommands", {"commands": json.dumps(commands)})
+    ])})
     log("Telegram commands configured.")
 
 
@@ -973,7 +1037,9 @@ def main():
     log("========================================")
     log(f"Watching: {', '.join(SHAPES)}")
     log(f"Check interval: {CHECK_INTERVAL:g} seconds")
-    log(f"State file: {STATE_FILE}")
+    log(f"Memory file: {STATE_FILE}" + ("" if MEMORY_OK else "  (NOT saved between deploys)"))
+    if not MEMORY_OK:
+        log("Add a Railway Volume mounted at /data so the radar remembers what it has seen.")
 
     load_state()
     load_meta()
@@ -989,21 +1055,21 @@ def main():
     except Exception as e:
         log(f"Initial check failed: {e}")
 
-    threading.Thread(
-        target=telegram_listener, args=(offset,), daemon=True
-    ).start()
+    threading.Thread(target=telegram_listener, args=(offset,), daemon=True).start()
 
-    if STARTUP_PING:
-        with LOCK:
+    if STARTUP_PING and not SHOP_LOCKED:
+        with DATA_LOCK:
             total = len(CURRENT_SNAPSHOT)
             live = sum(1 for it in CURRENT_SNAPSHOT.values() if it["available"])
-        if not SHOP_LOCKED:
-            send_text(
-                "📡 <b>Deck radar online</b>\n"
-                f"{LINE}\n"
-                f"🎯 tracking {total} variants · {live} in stock\n"
-                f"⚡ checking every {CHECK_INTERVAL:g}s"
-            )
+        lines = [
+            "📡 <b>Deck radar online</b>",
+            LINE,
+            f"🎯 tracking {total} variants · {live} in stock",
+            f"⚡ checking every {CHECK_INTERVAL:g}s",
+        ]
+        if not MEMORY_OK:
+            lines.append("⚠️ no saved memory: add a Railway Volume at /data")
+        send_text("\n".join(lines))
 
     log("🟢 RADAR ONLINE")
 
@@ -1012,6 +1078,8 @@ def main():
     while True:
         started = time.time()
         refresh_fx()
+        expire_password()
+        maybe_daily_ping()
         try:
             check_stock()
             if warned:
@@ -1019,21 +1087,18 @@ def main():
                 warned = False
             fails = 0
         except ShopLocked as e:
-            note_locked(e.text)   # normal before a drop: no error, no backoff
+            note_locked(e.text)       # normal before a drop: no error, no backoff
             fails = 0
         except Exception as e:
             fails += 1
             log(f"Check failed ({fails} in a row): {e}")
             if fails >= OFFLINE_AFTER and not warned:
-                send_text(
-                    "⚠️ <b>Radar can't reach the store.</b>\n"
-                    "Still trying. I'll tell you when it's back."
-                )
+                send_text("⚠️ <b>Radar can't reach the store.</b>\nStill trying. I'll tell you when it's back.")
                 warned = True
 
-        # back off when the store is struggling or rate limiting
+        # back off when the shop is struggling; a little jitter keeps the rhythm irregular
         delay = CHECK_INTERVAL if fails == 0 else min(60, CHECK_INTERVAL * 2 ** min(fails, 4))
-        time.sleep(max(0, delay - (time.time() - started)))
+        time.sleep(max(0, delay + random.uniform(0, 0.4) - (time.time() - started)))
 
 
 if __name__ == "__main__":
