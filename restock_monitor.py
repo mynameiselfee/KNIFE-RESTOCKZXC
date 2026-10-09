@@ -624,9 +624,12 @@ def send_test_alerts(items):
         return
     live = [it for it in items if it["available"]]
     if not live:
-        send_text("🧪 <b>TEST</b> · nothing is in stock right now.\nHere is a sample so you can see the look:")
+        send_text("🧪 <b>TEST</b> · nothing is in stock right now.\nHere are two samples so you can see both looks:")
         first = items[0]
-        send_alert([it for it in items if it["handle"] == first["handle"]][:2], test=True)
+        deck = [it for it in items if it["handle"] == first["handle"]]
+        send_alert(deck[:1], test=True)           # one size: Quick checkout + Cart page
+        if len(deck) > 1:
+            send_alert(deck[:2], test=True)       # two sizes: one ⚡ button per size
         return
     groups = group_by_deck(live)
     send_text(f"🧪 <b>TEST</b> · {len(groups)} deck(s) in stock right now. Sending their alerts:")
