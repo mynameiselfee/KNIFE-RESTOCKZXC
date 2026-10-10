@@ -4,7 +4,9 @@ Watches knifemfg.co for KH1 / KL2 / KL1 / KB1 decks and alerts you on Telegram.
 
 Railway variables
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    required
-  CHECK_INTERVAL        seconds between checks (default 5, minimum 2)
+  CHECK_INTERVAL        seconds between checks in calm mode (default 12, minimum 2)
+  DROP_INTERVAL         seconds between checks in drop mode (default 4, minimum 2)
+  DROP_MINUTES          how long /drop keeps drop mode on (default 30)
   LOG_EVERY             1 = log every check (default 60, about every 5 min)
   STARTUP_PING          0 turns off the "radar online" message
   ALERT_ON_START        0 = stay silent about decks already in stock at start-up
@@ -41,7 +43,13 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "5")))
+VERSION = "3.0 (11 Oct 2026)"
+STARTED_AT = time.time()
+
+CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "12")))   # calm mode: easy on the shop
+DROP_INTERVAL = max(2.0, float(os.getenv("DROP_INTERVAL", "4")))      # drop mode: fast
+DROP_MINUTES = max(1.0, float(os.getenv("DROP_MINUTES", "30")))
+AFTER_ALERT_MINUTES = 10                                              # stay fast after a restock
 LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))
 STARTUP_PING = os.getenv("STARTUP_PING", "1") == "1"
 ALERT_ON_START = os.getenv("ALERT_ON_START", "1") == "1"
@@ -315,8 +323,64 @@ PACE = {"extra": 0.0, "last_limit": 0.0, "buster": os.getenv("CACHE_BUSTER", "1"
 HEALTH = {"error": ""}      # why the last check failed ("" = all good)
 
 
+DROP = {"from": 0.0, "until": 0.0}     # drop mode window (unix seconds)
+
+
+def fast_now():
+    return DROP["from"] <= time.time() <= DROP["until"]
+
+
+def base_interval():
+    return DROP_INTERVAL if fast_now() else CHECK_INTERVAL
+
+
 def current_interval():
-    return CHECK_INTERVAL + PACE["extra"]
+    return base_interval() + PACE["extra"]
+
+
+def clock(ts):
+    """HH:MM in your time zone (TZ_OFFSET_HOURS, default Singapore)."""
+    return datetime.fromtimestamp(ts, timezone(timedelta(hours=TZ_OFFSET_HOURS))).strftime("%H:%M")
+
+
+def start_drop(minutes, begin=None):
+    """Fast checking from `begin` (default now) for `minutes`. Only ever extends a running window."""
+    now = time.time()
+    begin = now if begin is None else begin
+    end = begin + minutes * 60
+    if fast_now() and begin <= now:
+        end = max(end, DROP["until"])
+    DROP["from"], DROP["until"] = begin, end
+    META["drop_from"], META["drop_until"] = begin, end
+    save_meta()
+
+
+def end_drop():
+    DROP["from"] = DROP["until"] = 0.0
+    META["drop_from"] = META["drop_until"] = 0.0
+    save_meta()
+
+
+def schedule_for(clock_text):
+    """'20:00' -> (start, end): from 10 minutes before to 60 minutes after the next 20:00."""
+    try:
+        hour, minute = (int(x) for x in clock_text.split(":"))
+    except Exception:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target + timedelta(minutes=60) < now:
+        target += timedelta(days=1)
+    return target.timestamp() - 600, target.timestamp() + 3600
+
+
+def mode_line():
+    if fast_now():
+        return f"⚡ drop mode · every {current_interval():g}s · until {clock(DROP['until'])}"
+    return f"🐢 calm mode · every {current_interval():g}s · /drop for fast"
 
 
 def note_rate_limited():
@@ -445,7 +509,7 @@ def fetch_products_once():
     products = []
     stamp = int(time.time() * 1000)   # makes each request unique so the shop's CDN can't serve an old copy
     for page in range(1, 21):
-        url = f"{SITE}/products.json?limit=250&page={page}" + (f"&_={stamp}" if PACE["buster"] else "")
+        url = f"{SITE}/products.json?limit=250&page={page}" + (f"&_={stamp}" if PACE["buster"] and fast_now() else "")
         try:
             raw, final_url = fetch_page_retry(url)
         except RateLimited:
@@ -882,7 +946,8 @@ def status_text():
         reason = HEALTH["error"] or "store unreachable"
         lines.append(f"⚠️ {reason} · data is {ago(age)[:-4]} old")
     else:
-        lines.append(f"🕒 checked {ago(age)} · every {current_interval():g}s")
+        lines.append(f"🕒 checked {ago(age)}")
+    lines.append(mode_line())
     if last_drop:
         lines.append(
             f"🎯 last drop · {' '.join(last_drop['shapes'])} {esc(last_drop['product'])}"
@@ -902,9 +967,10 @@ def help_text():
         "\n"
         "<h>Commands</h>\n"
         "/status — stock right now\n"
+        "/drop — fast checking for a drop\n"
         "/help — this screen\n"
         f"{LINE}\n"
-        f"🟢 online · checking every {current_interval():g}s\n"
+        f"🟢 online · {mode_line()}\n"
         f"💱 prices ≈ S$ (1 USD = {FX['rate']:.2f})"
     )
 
@@ -1000,6 +1066,7 @@ def check_stock():
 
     if reopened:
         SHOP_LOCKED = False
+        start_drop(DROP_MINUTES)
         button = {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]}
         if PW["using"]:
             log("Inside the shop with your password")
@@ -1030,6 +1097,7 @@ def check_stock():
             save_state()
         if delivered:
             remember_drop([it for it in wanted if it["id"] in delivered])
+            start_drop(AFTER_ALERT_MINUTES)            # more usually follows a restock
         missed = len(pending - delivered)
         if missed:
             log(f"{missed} alert(s) could not be delivered. Retrying on the next check.")
@@ -1108,6 +1176,55 @@ def send_test_alert():
     send_test_alerts(items)
 
 
+def handle_drop(argument):
+    """/drop            fast checking now for DROP_MINUTES
+       /drop 45         fast checking now for 45 minutes
+       /drop 20:00      fast from 19:50 to 21:00 (your time zone)
+       /drop off        back to calm"""
+    arg = argument.strip().lower()
+    if arg in ("off", "stop", "calm"):
+        end_drop()
+        send_text(f"🐢 <h>Calm mode</h>\n{LINE}\n{mode_line()}")
+        return
+    if not arg:
+        start_drop(DROP_MINUTES)
+    elif arg.replace(".", "", 1).isdigit():
+        start_drop(min(float(arg), 720))
+    elif ":" in arg:
+        window = schedule_for(arg)
+        if not window:
+            send_text("🤔 I couldn't read that time. Try <b>/drop 20:00</b> (24-hour clock).")
+            return
+        begin, end = window
+        start_drop((end - begin) / 60, begin=begin)
+        if begin > time.time():
+            send_text(
+                f"📅 <h>Drop mode scheduled</h>\n{LINE}\n"
+                f"⚡ {clock(begin)} to {clock(end)}, checking every {DROP_INTERVAL:g}s.\n"
+                "/drop off cancels it."
+            )
+            return
+    else:
+        send_text("🤔 Try <b>/drop</b>, <b>/drop 45</b> (minutes), <b>/drop 20:00</b> or <b>/drop off</b>.")
+        return
+    send_text(f"⚡ <h>Drop mode on</h>\n{LINE}\n{mode_line()}\n/calm switches it off.")
+
+
+def info_text():
+    up = ago(time.time() - STARTED_AT)[:-4]
+    return "\n".join([
+        "🛠 <h>Radar info</h>",
+        LINE,
+        f"version {VERSION}",
+        f"running for {up}",
+        f"memory {'saved' if MEMORY_OK else 'NOT saved (add a Volume at /data)'}",
+        mode_line(),
+        f"calm {CHECK_INTERVAL:g}s · drop {DROP_INTERVAL:g}s · extra {PACE['extra']:g}s",
+        f"fonts: headings {FONT_STYLE}, buttons {BUTTON_STYLE or FONT_STYLE}",
+        f"watching {', '.join(SHAPES)}",
+    ])
+
+
 def handle_command(command):
     if command == "/status":
         send_text(status_text(), status_markup())
@@ -1115,6 +1232,10 @@ def handle_command(command):
         send_text(help_text(), help_markup())
     elif command == "/test":
         send_test_alert()
+    elif command == "/calm":
+        handle_drop("off")
+    elif command == "/info":
+        send_text(info_text())
     else:
         send_text("❓ Unknown command.\n\nUse /help.")
 
@@ -1181,6 +1302,10 @@ def telegram_listener(offset):
                     continue
                 command = text.split()[0].lower().split("@")[0]
                 log(f"Command received: {command}")
+                if command == "/drop":
+                    parts = text.split(None, 1)
+                    handle_drop(parts[1] if len(parts) > 1 else "")
+                    continue
                 if command == "/password":
                     parts = text.split(None, 1)
                     handle_password(message["chat"]["id"], message["message_id"],
@@ -1202,6 +1327,7 @@ def setup_telegram():
     telegram_api("deleteWebhook", {"drop_pending_updates": "false"})   # long polling needs it off
     telegram_api("setMyCommands", {"commands": json.dumps([
         {"command": "status", "description": "Check current stock"},
+        {"command": "drop", "description": "Fast checking for a drop"},
         {"command": "help", "description": "Show commands"},
     ])})
     log("Telegram commands configured.")
@@ -1213,21 +1339,24 @@ def setup_telegram():
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. In Railway open your service, tap Variables and add it.")
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID is not set.")
+        raise RuntimeError("TELEGRAM_CHAT_ID is not set. In Railway open your service, tap Variables and add it.")
 
     log("========================================")
     log("📡 KNIFE MFG CO DECK RADAR")
     log("========================================")
     log(f"Watching: {', '.join(SHAPES)}")
-    log(f"Check interval: {CHECK_INTERVAL:g} seconds")
+    log(f"Version {VERSION}")
+    log(f"Check interval: {CHECK_INTERVAL:g}s calm, {DROP_INTERVAL:g}s in drop mode")
     log(f"Memory file: {STATE_FILE}" + ("" if MEMORY_OK else "  (NOT saved between deploys)"))
     if not MEMORY_OK:
         log("Add a Railway Volume mounted at /data so the radar remembers what it has seen.")
 
     load_state()
     load_meta()
+    DROP["from"] = float(META.get("drop_from") or 0)
+    DROP["until"] = float(META.get("drop_until") or 0)
     refresh_fx()
     setup_telegram()
     offset = drop_stale_updates()
@@ -1255,7 +1384,7 @@ def main():
             "📡 <h>Deck radar online</h>",
             LINE,
             f"🎯 tracking {total} variants · {live} in stock",
-            f"⚡ checking every {current_interval():g}s",
+            mode_line(),
         ]
         if not MEMORY_OK:
             lines.append("⚠️ no saved memory: add a Railway Volume at /data")
