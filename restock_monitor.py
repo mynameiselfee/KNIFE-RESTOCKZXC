@@ -14,6 +14,12 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILE = os.path.join(HERE, os.getenv("RADAR_FILE", "restock_monitor.py"))
+
+if os.path.abspath(__file__) == os.path.abspath(FILE):
+    sys.exit(
+        "WRONG FILE: this is the TEST file, but it is saved under the radar's name "
+        f"({os.path.basename(FILE)}). Replace its contents with restock_radar_railway.py."
+    )
 TMP = tempfile.mkdtemp()
 os.environ.update(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="42", STATE_FILE=os.path.join(TMP, "state.json"))
 for name in list(os.environ):
