@@ -597,7 +597,7 @@ def telegram_api(method, params=None, _retry=True):
     except urllib.error.HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8")[:200]
+            body = e.read().decode("utf-8")[:2000]      # read it all: the JSON must stay complete
         except Exception:
             pass
         if e.code == 429 and _retry:
@@ -614,7 +614,7 @@ def telegram_api(method, params=None, _retry=True):
             description = ""
         harmless = (e.code == 409 and method == "getUpdates") or "not modified" in description
         if not harmless:
-            log(f"Telegram {method} HTTP {e.code}: {body}")
+            log(f"Telegram {method} HTTP {e.code}: {body[:300]}")
         return {"ok": False, "error": f"HTTP {e.code}", "description": description}
     except Exception as e:
         log(f"Telegram {method} error: {e}")
