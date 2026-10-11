@@ -22,9 +22,13 @@ Railway variables
   USD_TO_SGD            fixed exchange rate instead of the live one (optional)
   CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
+  PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
+  LIVE_RADAR            0 turns the live radar page off
   SHOP_URL              only for testing against a fake shop
 """
 import gzip
+import hashlib
+import hmac
 import html
 import http.cookiejar
 import json
@@ -37,6 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -48,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "3.7 (11 Oct 2026)"
+VERSION = "4.0 (11 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "12")))   # calm mode: easy on the shop
@@ -1127,6 +1132,523 @@ def handle_smart(argument):
 
 
 # ============================================================
+# LIVE RADAR: a page that opens inside Telegram
+# Four sizes, big BUY buttons, drop mode, your pickups and parcels, a sweeping
+# radar. It reads the radar's own memory every 2 seconds, so it never adds
+# a single request to the shop. Only YOUR Telegram can open it: the page checks
+# the signature Telegram puts on every Mini App.
+# ============================================================
+
+LIVE_RADAR = os.getenv("LIVE_RADAR", "1") == "1"
+
+
+def public_url():
+    """The https address of the radar page. Railway adds RAILWAY_PUBLIC_DOMAIN once a domain exists."""
+    url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if not url:
+        domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        url = f"https://{domain}" if domain else ""
+    return url if url.startswith("https://") else ""
+
+
+def radar_markup():
+    url = public_url()
+    if not (LIVE_RADAR and url):
+        return None
+    return {"inline_keyboard": [[{"text": btn("📡 Open live radar"), "web_app": {"url": url}}]]}
+
+
+def verify_init_data(init_data, max_age=86400):
+    """Checks Telegram's signature on a Mini App. Returns the user, or None if it is not genuine."""
+    if not init_data or not TELEGRAM_BOT_TOKEN:
+        return None
+    try:
+        fields = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        received = fields.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        secret = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+        expected = hmac.new(secret, check.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, received):
+            return None
+        if time.time() - int(fields.get("auth_date", "0")) > max_age:
+            return None
+        return json.loads(fields.get("user", "{}"))
+    except Exception:
+        return None
+
+
+def dashboard_state():
+    """Everything the live page shows, as plain data."""
+    with DATA_LOCK:
+        snapshot = dict(CURRENT_SNAPSHOT)
+        last_check = LAST_CHECK
+    now = time.time()
+    tiles = []
+    for shape in SHAPES:
+        live = [it for it in snapshot.values() if it["shape"] == shape and it["available"]]
+        tiles.append({
+            "shape": shape,
+            "count": len(live),
+            "live": [{"product": it["product"], "size": it["size"], "sgd": money(it["price"]),
+                      "buy": it["cart_url"], "page": it["product_url"], "image": it["image"]}
+                     for it in live[:6]],
+        })
+    last_event = None
+    events = META.get("events") or []
+    if events:
+        event = events[-1]
+        gone = [e["gone"] for e in event["items"].values() if e["gone"] is not None]
+        last_event = {
+            "product": event["product"],
+            "t": event["t"],
+            "items": [{"shape": e["shape"], "size": e["size"], "gone": e["gone"]} for e in event["items"].values()],
+            "heat": heat_label(min(gone) if gone else None),
+        }
+    slots = smart_slots()
+    next_drop = slot_start(slots[0][0], slots[0][1]).timestamp() if slots else None
+    return {
+        "version": VERSION.split(" ")[0],
+        "now": now,
+        "checked_ago": (now - last_check) if last_check else None,
+        "locked": bool(SHOP_LOCKED),
+        "problem": HEALTH["error"],
+        "mode": {"fast": fast_now(), "sticky": bool(DROP.get("sticky")), "until": DROP["until"],
+                 "interval": current_interval(), "idle": DROP_IDLE_MINUTES},
+        "tiles": tiles,
+        "last_event": last_event,
+        "pickups": len(META.get("purchases") or []),
+        "parcels": [{"label": p["label"], "status": status_label(p.get("status")), "event": p.get("event") or ""}
+                    for p in META.get("parcels") or [] if not p.get("delivered")],
+        "next_drop": next_drop,
+    }
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b1126">
+<title>KNIFE MFG CO radar</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#0b1126;--panel:#131b3a;--line:#2a3a78;--cyan:#4fd8ff;--yellow:#ffd23f;--green:#35f28a;--red:#ff5d73;--dim:#6b779e;--text:#e8edff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;-webkit-text-size-adjust:100%}
+body{padding:max(14px,env(safe-area-inset-top)) 14px max(24px,env(safe-area-inset-bottom));min-height:100vh;overflow-x:hidden}
+header{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px}
+.brand{font-size:15px;font-weight:700;letter-spacing:2px;color:var(--yellow)}
+.brand small{display:block;font-size:10px;letter-spacing:1px;color:var(--dim);font-weight:400;margin-top:2px}
+.chip{font-size:11px;letter-spacing:1px;padding:6px 10px;border:2px solid var(--line);background:var(--panel);white-space:nowrap}
+.chip.fast{border-color:var(--yellow);color:var(--yellow)}
+.chip.calm{border-color:var(--cyan);color:var(--cyan)}
+.chip.warn{border-color:var(--red);color:var(--red)}
+.chip.lock{border-color:var(--red);color:var(--red)}
+.card{border:2px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px;position:relative}
+.card h2{margin:0 0 8px;font-size:11px;letter-spacing:2px;color:var(--dim);font-weight:400}
+#radarWrap{display:flex;justify-content:center;padding:6px 0 2px}
+#radar{position:relative;width:216px;height:216px;border-radius:50%;border:2px solid var(--line);
+ background:radial-gradient(circle,transparent 0 24%,rgba(79,216,255,.18) 24.5% 25.5%,transparent 26% 49%,rgba(79,216,255,.18) 49.5% 50.5%,transparent 51% 74%,rgba(79,216,255,.18) 74.5% 75.5%,transparent 76%),var(--bg);overflow:hidden}
+#radar::before{content:"";position:absolute;left:0;top:0;right:0;bottom:0;border-radius:50%;
+ background:conic-gradient(from 0deg,rgba(53,242,138,0) 0deg,rgba(53,242,138,.35) 55deg,rgba(53,242,138,0) 56deg);animation:sweep 3.2s linear infinite}
+#radar.fast::before{animation-duration:1.1s;background:conic-gradient(from 0deg,rgba(255,210,63,0) 0deg,rgba(255,210,63,.4) 55deg,rgba(255,210,63,0) 56deg)}
+@keyframes sweep{to{transform:rotate(360deg)}}
+#radar::after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(79,216,255,.15);box-shadow:-108px 108px 0 0 transparent}
+.blip{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;border:2px solid var(--line);background:var(--bg);color:var(--dim);z-index:2}
+.blip.live{border-color:var(--green);color:var(--green);animation:ping 1.2s ease-out infinite}
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(53,242,138,.7)}100%{box-shadow:0 0 0 18px rgba(53,242,138,0)}}
+#core{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;z-index:3}
+#coreNum{font-size:34px;font-weight:700;color:var(--green);line-height:1}
+#coreLbl{font-size:10px;letter-spacing:2px;color:var(--dim);margin-top:4px}
+.shape{border:2px solid var(--line);background:var(--panel);margin-bottom:10px;padding:10px 12px}
+.shape.live{border-color:var(--green);animation:glow 1.6s ease-in-out infinite}
+@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(53,242,138,.0)}50%{box-shadow:0 0 14px 2px rgba(53,242,138,.45)}}
+.shape .top{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:700;letter-spacing:1px}
+.shape.sold{opacity:.55}
+.shape.sold .top{font-weight:400}
+.tag{font-size:10px;letter-spacing:1px;padding:3px 7px;border:1px solid currentColor}
+.tag.live{color:var(--green)}.tag.sold{color:var(--dim)}
+.deck{display:flex;gap:10px;align-items:center;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+.deck img{width:46px;height:46px;object-fit:contain;background:#fff;flex:none}
+.deck .meta{flex:1;min-width:0}
+.deck .name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deck .sub{font-size:11px;color:var(--dim);margin-top:3px}
+.buy{flex:none;font-family:inherit;font-weight:700;font-size:13px;letter-spacing:1px;color:#10172e;background:var(--green);border:0;padding:12px 14px;min-height:44px;cursor:pointer;box-shadow:0 3px 0 #1c9b58}
+.buy:active{transform:translateY(2px);box-shadow:0 1px 0 #1c9b58}
+.modeRow{display:flex;gap:8px}
+.btn{flex:1;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:1px;color:var(--text);background:transparent;border:2px solid var(--line);padding:12px 6px;min-height:44px;cursor:pointer}
+.btn.on{border-color:var(--yellow);color:var(--yellow)}
+.btn.on.calmBtn{border-color:var(--cyan);color:var(--cyan)}
+.btn:active{transform:translateY(1px)}
+#modeNote{font-size:11px;color:var(--dim);margin-top:8px;line-height:1.5}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.stat{border:2px solid var(--line);background:var(--panel);padding:10px 6px;text-align:center}
+.stat b{display:block;font-size:20px;color:var(--yellow)}
+.stat span{display:block;font-size:10px;letter-spacing:1px;color:var(--dim);margin-top:4px}
+.bar{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:6px}
+.bar .k{width:96px;flex:none;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .track{flex:1;height:10px;background:var(--bg);border:1px solid var(--line)}
+.bar .fill{height:100%;background:var(--green)}
+.bar .v{width:64px;flex:none;text-align:right;color:var(--dim)}
+.heat{margin-top:10px;font-size:12px;color:var(--yellow)}
+.parcel{font-size:12px;margin-top:6px;line-height:1.5}
+.parcel i{font-style:normal;color:var(--dim)}
+#ground{position:relative;height:34px;margin:6px -14px 0;border-top:2px solid var(--line);overflow:hidden}
+#board{position:absolute;left:-60px;bottom:6px;width:46px;height:14px;animation:roll 7s linear infinite}
+#board.fast{animation-duration:3s}
+#board .deck2{position:absolute;left:0;right:0;top:0;height:6px;background:var(--yellow);border-radius:3px;box-shadow:0 2px 0 #b58f00}
+#board .w{position:absolute;bottom:0;width:8px;height:8px;background:var(--red);border-radius:50%}
+#board .w.a{left:6px}#board .w.b{right:6px}
+@keyframes roll{0%{transform:translateX(0)}45%{transform:translateX(220px) rotate(0)}55%{transform:translateX(250px) translateY(-14px) rotate(360deg)}60%{transform:translateX(262px) rotate(360deg)}100%{transform:translateX(520px)}}
+footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;margin-top:10px}
+#locked{display:none;text-align:center;padding:60px 20px;color:var(--dim);line-height:1.7}
+#locked b{color:var(--yellow)}
+.pop{position:fixed;top:-30px;z-index:9;font-size:22px;animation:fall 2.4s ease-in forwards;pointer-events:none}
+@keyframes fall{to{transform:translateY(110vh) rotate(540deg);opacity:.9}}
+#flash{position:fixed;inset:0;background:rgba(53,242,138,.28);opacity:0;pointer-events:none;z-index:8}
+#flash.go{animation:flash .9s ease-out}
+@keyframes flash{0%{opacity:1}100%{opacity:0}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<div id="flash"></div>
+<div id="locked"><b>KNIFE MFG CO</b><br><br>Open this page from the bot in Telegram:<br>send <b>/radar</b> and tap <b>Open live radar</b>.</div>
+<div id="app" style="display:none">
+  <header>
+    <div class="brand">KNIFE MFG CO<small>DECK RADAR · LIVE</small></div>
+    <div id="chip" class="chip calm">CALM</div>
+  </header>
+
+  <div class="card">
+    <div id="radarWrap"><div id="radar"><div id="core"><div id="coreNum">0</div><div id="coreLbl">IN STOCK</div></div></div></div>
+    <div id="ground"><div id="board"><div class="deck2"></div><div class="w a"></div><div class="w b"></div></div></div>
+  </div>
+
+  <div id="shapes"></div>
+
+  <div class="card">
+    <h2>SPEED</h2>
+    <div class="modeRow">
+      <button id="dropBtn" class="btn">⚡ DROP MODE</button>
+      <button id="calmBtn" class="btn calmBtn">🐢 CALM</button>
+    </div>
+    <div id="modeNote"></div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b id="sPick">0</b><span>PICKUPS</span></div>
+    <div class="stat"><b id="sParcel">0</b><span>PARCELS</span></div>
+    <div class="stat"><b id="sNext">--</b><span>NEXT DROP</span></div>
+  </div>
+
+  <div class="card" id="reportCard" style="display:none">
+    <h2>LAST DROP</h2>
+    <div id="reportName" style="font-size:13px"></div>
+    <div id="reportBars"></div>
+    <div id="heat" class="heat"></div>
+  </div>
+
+  <div class="card" id="parcelCard" style="display:none">
+    <h2>PARCELS ON THEIR WAY</h2>
+    <div id="parcelList"></div>
+  </div>
+
+  <footer id="foot">connecting…</footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    try { tg.ready(); tg.expand(); tg.setHeaderColor("#0b1126"); tg.setBackgroundColor("#0b1126"); } catch (e) {}
+  }
+  var initData = tg && tg.initData ? tg.initData : "";
+  var $ = function (id) { return document.getElementById(id); };
+  var state = null, fetchedAt = 0, prevLive = null, okAt = 0;
+  var BLIPS = [[50, 12], [88, 50], [50, 88], [12, 50]];
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function dur(sec) {
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return sec + "s";
+    if (sec < 3600) return Math.floor(sec / 60) + "m " + ("0" + (sec % 60)).slice(-2) + "s";
+    if (sec < 86400) return Math.floor(sec / 3600) + "h " + ("0" + Math.floor((sec % 3600) / 60)).slice(-2) + "m";
+    return Math.floor(sec / 86400) + "d " + Math.floor((sec % 86400) / 3600) + "h";
+  }
+  function openUrl(url) {
+    if (!/^https?:\/\//i.test(url)) return;
+    if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank", "noopener");
+  }
+  function haptic(kind) {
+    try { if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(kind); else if (navigator.vibrate) navigator.vibrate([80, 60, 80]); } catch (e) {}
+  }
+  function celebrate() {
+    var f = $("flash"); f.classList.remove("go"); void f.offsetWidth; f.classList.add("go");
+    var icons = ["🛹", "⚡", "🎉", "🔥", "✨"];
+    for (var i = 0; i < 22; i++) {
+      var p = el("div", "pop", icons[i % icons.length]);
+      p.style.left = Math.round(Math.random() * 92) + "vw";
+      p.style.animationDelay = (Math.random() * 0.6).toFixed(2) + "s";
+      document.body.appendChild(p);
+      (function (n) { setTimeout(function () { if (n.parentNode) n.parentNode.removeChild(n); }, 3400); })(p);
+    }
+    haptic("success");
+  }
+
+  function renderRadar(s) {
+    var r = $("radar");
+    r.className = s.mode.fast ? "fast" : "";
+    var old = r.querySelectorAll(".blip");
+    for (var i = 0; i < old.length; i++) r.removeChild(old[i]);
+    var total = 0;
+    s.tiles.forEach(function (t, idx) {
+      total += t.count;
+      var b = el("div", "blip" + (t.count ? " live" : ""), t.shape);
+      b.style.left = BLIPS[idx % 4][0] + "%";
+      b.style.top = BLIPS[idx % 4][1] + "%";
+      r.appendChild(b);
+    });
+    $("coreNum").textContent = String(total);
+    $("coreNum").style.color = total ? "#35f28a" : "#6b779e";
+    $("coreLbl").textContent = s.locked ? "LOCKED" : (total ? "IN STOCK" : "SOLD OUT");
+    $("board").className = s.mode.fast ? "fast" : "";
+  }
+
+  function renderShapes(s) {
+    var box = $("shapes");
+    while (box.firstChild) box.removeChild(box.firstChild);
+    s.tiles.forEach(function (t) {
+      var live = t.count > 0;
+      var card = el("div", "shape " + (live ? "live" : "sold"));
+      var top = el("div", "top");
+      top.appendChild(el("span", "", t.shape));
+      top.appendChild(el("span", "tag " + (live ? "live" : "sold"), live ? (t.count + " IN STOCK") : "SOLD OUT"));
+      card.appendChild(top);
+      t.live.forEach(function (d) {
+        var row = el("div", "deck");
+        if (d.image) { var im = el("img"); im.src = d.image; im.alt = ""; im.loading = "lazy"; row.appendChild(im); }
+        var meta = el("div", "meta");
+        meta.appendChild(el("div", "name", d.product));
+        meta.appendChild(el("div", "sub", [d.size, d.sgd].filter(Boolean).join(" · ")));
+        row.appendChild(meta);
+        var b = el("button", "buy", "⚡ BUY");
+        b.addEventListener("click", function () { haptic("warning"); openUrl(d.buy); });
+        row.appendChild(b);
+        card.appendChild(row);
+      });
+      box.appendChild(card);
+    });
+  }
+
+  function renderMode(s) {
+    var chip = $("chip");
+    var label = "CALM", cls = "calm";
+    if (s.locked) { label = "🔒 LOCKED"; cls = "lock"; }
+    else if (s.problem) { label = "⚠ LIMITED"; cls = "warn"; }
+    else if (s.mode.fast) { label = "⚡ DROP MODE"; cls = "fast"; }
+    chip.textContent = label; chip.className = "chip " + cls;
+    $("dropBtn").className = "btn" + (s.mode.fast ? " on" : "");
+    $("calmBtn").className = "btn calmBtn" + (!s.mode.fast ? " on" : "");
+    var note = "checking every " + Math.round(s.mode.interval) + "s";
+    if (s.mode.fast && s.mode.sticky) note += " · calm again after " + Math.round(s.mode.idle) + " min with no activity";
+    if (s.problem) note += " · " + s.problem;
+    $("modeNote").textContent = note;
+  }
+
+  function renderStats(s) {
+    $("sPick").textContent = String(s.pickups);
+    $("sParcel").textContent = String(s.parcels.length);
+    $("sNext").textContent = s.next_drop ? dur(Math.max(0, s.next_drop - Date.now() / 1000)) : "--";
+  }
+
+  function speedPct(sec) {
+    var steps = [[30, 100], [60, 88], [120, 75], [300, 62], [900, 50], [1800, 38], [3600, 25]];
+    for (var i = 0; i < steps.length; i++) { if (sec <= steps[i][0]) return steps[i][1]; }
+    return 12;
+  }
+
+  function renderReport(s) {
+    var card = $("reportCard");
+    if (!s.last_event) { card.style.display = "none"; return; }
+    card.style.display = "";
+    $("reportName").textContent = s.last_event.product;
+    var bars = $("reportBars");
+    while (bars.firstChild) bars.removeChild(bars.firstChild);
+    var fastest = null;
+    s.last_event.items.forEach(function (it) {
+      var row = el("div", "bar");
+      row.appendChild(el("div", "k", it.shape + (it.size ? " · " + it.size : "")));
+      var track = el("div", "track"), fill = el("div", "fill");
+      var pct = it.gone === null ? 0 : speedPct(it.gone);
+      fill.style.width = pct + "%";
+      track.appendChild(fill); row.appendChild(track);
+      row.appendChild(el("div", "v", it.gone === null ? "live" : dur(it.gone)));
+      bars.appendChild(row);
+      if (it.gone !== null && (fastest === null || it.gone < fastest)) fastest = it.gone;
+    });
+    $("heat").textContent = s.last_event.heat || "";
+  }
+
+  function renderParcels(s) {
+    var card = $("parcelCard"), list = $("parcelList");
+    while (list.firstChild) list.removeChild(list.firstChild);
+    if (!s.parcels.length) { card.style.display = "none"; return; }
+    card.style.display = "";
+    s.parcels.forEach(function (p) {
+      var row = el("div", "parcel");
+      row.appendChild(el("b", "", p.label));
+      row.appendChild(el("br"));
+      row.appendChild(el("i", "", p.status + (p.event ? " · " + p.event : "")));
+      list.appendChild(row);
+    });
+  }
+
+  function tick() {
+    if (!state) return;
+    var ago = (state.checked_ago === null ? null : state.checked_ago + (Date.now() - fetchedAt) / 1000);
+    var offline = (Date.now() - okAt) > 10000;
+    $("foot").textContent = offline ? "offline · reconnecting…"
+      : (ago === null ? "waiting for the first check" : "checked " + dur(ago) + " ago") + " · v" + state.version;
+    $("sNext").textContent = state.next_drop ? dur(Math.max(0, state.next_drop - Date.now() / 1000)) : "--";
+  }
+
+  function render(s) {
+    var live = {};
+    s.tiles.forEach(function (t) { live[t.shape] = t.count; });
+    var arrived = false;
+    if (prevLive) { for (var k in live) { if (live[k] > (prevLive[k] || 0)) arrived = true; } }
+    prevLive = live;
+    state = s; fetchedAt = Date.now(); okAt = fetchedAt;
+    $("locked").style.display = "none"; $("app").style.display = "";
+    renderRadar(s); renderShapes(s); renderMode(s); renderStats(s); renderReport(s); renderParcels(s); tick();
+    if (arrived) celebrate();
+  }
+
+  function showLocked() { $("app").style.display = "none"; $("locked").style.display = "block"; }
+
+  function call(method, path, body) {
+    var opt = { method: method, cache: "no-store", headers: { "X-Init-Data": initData } };
+    if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+    return fetch(path, opt).then(function (r) {
+      if (r.status === 401 || r.status === 403) { showLocked(); throw new Error("locked"); }
+      return r.json();
+    });
+  }
+  function poll() { call("GET", "/api/state").then(render).catch(function (e) { if (e && e.message !== "locked") console.error(e && e.stack || e); }); }
+
+  $("dropBtn").addEventListener("click", function () { haptic("warning"); call("POST", "/api/drop", { on: true }).then(render).catch(function () {}); });
+  $("calmBtn").addEventListener("click", function () { call("POST", "/api/drop", { on: false }).then(render).catch(function () {}); });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+  setInterval(poll, 2000);
+  setInterval(tick, 500);
+  poll();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+class RadarHandler(BaseHTTPRequestHandler):
+    server_version = "KnifeRadar"
+
+    def log_message(self, *args):
+        pass
+
+    def reply(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else str(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def owner(self):
+        """True only for your own Telegram. Anyone else gets 401 or 403 and nothing else."""
+        user = verify_init_data(self.headers.get("X-Init-Data", ""))
+        if user is None:
+            self.reply(401, '{"error": "open this from Telegram"}')
+            return False
+        if str(user.get("id")) != str(TELEGRAM_CHAT_ID):
+            self.reply(403, '{"error": "not yours"}')
+            return False
+        return True
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self.reply(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+        elif path == "/health":
+            self.reply(200, "ok", "text/plain")
+        elif path == "/api/state":
+            if self.owner():
+                self.reply(200, json.dumps(dashboard_state()))
+        else:
+            self.reply(404, '{"error": "not found"}')
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/api/drop":
+            self.reply(404, '{"error": "not found"}')
+            return
+        if not self.owner():
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(min(length, 2000)).decode("utf-8") or "{}")
+        except Exception:
+            self.reply(400, '{"error": "bad request"}')
+            return
+        if body.get("on"):
+            start_drop(DROP_IDLE_MINUTES, sticky=True)
+        else:
+            end_drop()
+        self.reply(200, json.dumps(dashboard_state()))
+
+
+def start_dashboard(port=None):
+    """Runs the page on its own thread. Returns the server (or None if it could not start)."""
+    port = int(os.getenv("PORT", "8080")) if port is None else port
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), RadarHandler)
+    except OSError as e:
+        log(f"Live radar page could not start on port {port}: {e}")
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = public_url()
+    log(f"Live radar page on port {server.server_address[1]}" + (f" · {url}" if url else " · no public domain yet"))
+    return server
+
+
+def handle_radar():
+    markup = radar_markup()
+    if markup:
+        send_text(
+            "📡 <h>Live radar</h>\n" + LINE + "\n"
+            "A live page inside Telegram: the four sizes, big BUY buttons, drop mode, "
+            "your pickups and parcels. It updates every 2 seconds from me, so it adds nothing to the shop.",
+            markup,
+        )
+    else:
+        send_text(
+            "📡 <h>Live radar needs a web address</h>\n" + LINE + "\n"
+            "1. Railway, your bot's service, <b>Settings</b>, <b>Networking</b>, <b>Generate Domain</b>.\n"
+            "2. Deploy once. Then send /radar again."
+        )
+
+
+# ============================================================
 # MY PICKUPS
 # The bot can't see your payment (it happens in the shop's own checkout),
 # so a pickup is counted when YOU tap "I bought it" or send /bought.
@@ -1340,8 +1862,35 @@ def track_link(number):
     return f"https://parcelsapp.com/en/tracking/{urllib.parse.quote(number)}"
 
 
+TRACK_HEALTH = {"service": "", "error": "", "told": False}
+
+
+def note_tracking_problem(error):
+    """Logs which tracking service failed. A rejected key (401/403) or a used-up plan (402) is
+    explained once in Telegram, with the variable to fix."""
+    service = TRACK_HEALTH.get("service") or "the tracking service"
+    code = getattr(error, "code", None)
+    TRACK_HEALTH["error"] = f"{service}: {error}"
+    log(f"Parcel check failed via {service}: {error}")
+    if code in (401, 402, 403) and not TRACK_HEALTH["told"]:
+        TRACK_HEALTH["told"] = True
+        if service == "USPS":
+            advice = ("🔑 <h>USPS didn't accept the keys</h>\n" + LINE + "\n"
+                      "Delete <b>USPS_CLIENT_ID</b> and <b>USPS_CLIENT_SECRET</b> in Railway "
+                      "(the bot works fine without them), or paste the right Consumer Key and Secret.")
+        elif code == 402:
+            advice = ("💳 <h>Parcels App plan used up</h>\n" + LINE + "\n"
+                      "Parcels App says your plan limit is reached. Check your plan on parcelsapp.com.")
+        else:
+            advice = ("🔑 <h>Parcels App didn't accept the key</h>\n" + LINE + "\n"
+                      "Check <b>PARCELS_API_KEY</b> in Railway: the key only, no spaces or quotes. "
+                      "Also confirm your email on parcelsapp.com. Or delete the variable to go back to links only.")
+        send_text(advice)
+
+
 def parcels_call(method, path, payload=None, timeout=25):
     """One call to the Parcels App API. Raises on any problem."""
+    TRACK_HEALTH["service"] = "Parcels App"
     request = urllib.request.Request(
         f"{PARCELS_BASE}{path}",
         data=None if payload is None else json.dumps(payload).encode("utf-8"),
@@ -1438,6 +1987,7 @@ def usps_link(number):
 
 def usps_token(force=False):
     """OAuth token for the USPS API, kept until it is about to expire."""
+    TRACK_HEALTH["service"] = "USPS"
     if not force and USPS_TOKEN["value"] and time.time() < USPS_TOKEN["until"] - 60:
         return USPS_TOKEN["value"]
     fields = {"grant_type": "client_credentials", "client_id": USPS_CLIENT_ID,
@@ -1465,6 +2015,7 @@ def usps_token(force=False):
 
 def usps_call(number, retry=True):
     """The raw USPS tracking reply, or None if USPS doesn't know the number yet (404)."""
+    TRACK_HEALTH["service"] = "USPS"
     request = urllib.request.Request(
         f"{USPS_BASE}/tracking/v3/tracking/{urllib.parse.quote(number)}?expand=DETAIL",
         headers={"Authorization": f"Bearer {usps_token()}", "Accept": "application/json"},
@@ -1559,8 +2110,16 @@ def parcel_info(number):
     return parcels_info(number)
 
 
+USPS_NUMBER = re.compile(r"9\d{19,25}|82\d{8}|[A-Z]{2}\d{9}US")
+
+
+def looks_like_usps(number):
+    """USPS tracking numbers: 9400... (20 to 26 digits), 82... (10 digits) or LZ123456789US."""
+    return bool(USPS_NUMBER.fullmatch(str(number).upper()))
+
+
 def parcel_markup(number):
-    if usps_ready():
+    if usps_ready() or looks_like_usps(number):
         return {"inline_keyboard": [[
             {"text": btn("🔎 USPS page"), "url": usps_link(number)},
             {"text": btn("🌏 Parcels"), "url": track_link(number)},
@@ -1607,8 +2166,10 @@ def poll_parcels(only=None):
         try:
             info = parcel_info(parcel["number"])
         except Exception as e:
-            log(f"Parcel check failed for {parcel['number']}: {e}")
+            note_tracking_problem(e)
             continue
+        TRACK_HEALTH["error"] = ""
+        TRACK_HEALTH["told"] = False
         if not info:
             continue
         changed = (info["status"], info["event"]) != (parcel.get("status"), parcel.get("event"))
@@ -1683,8 +2244,9 @@ def handle_track(argument):
                 else:
                     send_text("🔎 Nothing scanned yet. I'll tell you when the carrier does.")
             except Exception as e:
-                log(f"First parcel check failed: {e}")
-                send_text("⚠️ I couldn't reach the tracking service just now. I'll keep trying.")
+                note_tracking_problem(e)
+                if getattr(e, "code", None) not in (401, 402, 403):
+                    send_text("⚠️ I couldn't reach the tracking service just now. I'll keep trying.")
 
         if ASYNC_FIRST_LOOKUP:
             threading.Thread(target=first_lookup, daemon=True).start()
@@ -1765,10 +2327,14 @@ def ago(seconds):
 
 
 def status_markup():
-    return {"inline_keyboard": [[
+    rows = [[
         {"text": btn("🔄 Refresh"), "callback_data": "refresh"},
         {"text": btn("🛒 Open shop"), "url": SITE},
-    ]]}
+    ]]
+    radar = radar_markup()
+    if radar:
+        rows.append(radar["inline_keyboard"][0])
+    return {"inline_keyboard": rows}
 
 
 def help_markup():
@@ -1838,6 +2404,7 @@ def help_text():
         "\n"
         "<h>Stock</h>\n"
         "/status — stock right now\n"
+        "/radar — live radar page\n"
         "/drop — fast checking (/drop 45, /drop 20:00)\n"
         "/calm — back to calm checking\n"
         "/forecast — when drops usually happen\n"
@@ -2121,6 +2688,9 @@ def info_text():
         f"calm {CHECK_INTERVAL:g}s · drop {DROP_INTERVAL:g}s · extra {PACE['extra']:g}s",
         f"fonts: headings {FONT_STYLE}, buttons {BUTTON_STYLE or FONT_STYLE}",
         f"watching {', '.join(SHAPES)}",
+        "live radar page: " + (public_url() if LIVE_RADAR and public_url() else "needs a Railway domain (see /radar)"),
+        f"tracking: USPS keys {'yes' if usps_ready() else 'no'} · Parcels key {'yes' if PARCELS_KEY else 'no'}"
+        + (f"\n⚠️ last tracking problem: {esc(TRACK_HEALTH['error'])}" if TRACK_HEALTH["error"] else ""),
     ])
 
 
@@ -2137,6 +2707,8 @@ def handle_command(command):
         send_text(stats_text())
     elif command == "/forecast":
         send_text(forecast_text())
+    elif command == "/radar":
+        handle_radar()
     elif command == "/history":
         send_text(history_text())
     elif command == "/parcels":
@@ -2255,6 +2827,7 @@ def telegram_listener(offset):
 # Every command, in the order of the Menu button in Telegram.
 MENU_COMMANDS = [
     ("status", "Stock right now"),
+    ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
     ("calm", "Back to calm checking"),
     ("forecast", "When drops usually happen"),
@@ -2331,6 +2904,8 @@ def main():
 
     threading.Thread(target=telegram_listener, args=(offset,), daemon=True).start()
     threading.Thread(target=tracking_loop, daemon=True).start()
+    if LIVE_RADAR:
+        start_dashboard()
 
     if STARTUP_PING and not SHOP_LOCKED:
         with DATA_LOCK:
