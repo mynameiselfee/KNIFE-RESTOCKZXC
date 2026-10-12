@@ -23,7 +23,6 @@ Railway variables
   USD_TO_SGD            fixed exchange rate instead of the live one (optional)
   CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
-  PUSHOVER_TOKEN / PUSHOVER_USER   optional: a real alarm that breaks through Silent and Focus (see /alarm)
   CALLMEBOT_USER        optional: a Telegram voice call to your @username (see /alarm)
   PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
   LIVE_RADAR            0 turns the live radar page off
@@ -57,7 +56,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.7 (12 Oct 2026)"
+VERSION = "4.9 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -2064,30 +2063,30 @@ def handle_radar():
 
 # ============================================================
 # ALARM: wake me up when a drop lands
-# Telegram alone can't ring through Silent mode or a Sleep Focus, so the alarm uses three layers:
-#   1. Telegram wake-up messages that repeat every 45 seconds until you tap "I'm up"
-#   2. Pushover "emergency" alerts (optional): they repeat until acknowledged and can break through Silent
-#   3. A Telegram voice call from CallMeBot (optional)
-# It is off until you send /alarm on, and it never rings for the first read after a restart.
+# Telegram alone can't ring through Silent mode or a Sleep Focus, so the alarm is loud:
+#   1. Wake-up messages every 10 seconds, with no limit, until you tap "I'm awake"
+#   2. A Telegram voice call from CallMeBot every 3 minutes (optional, set CALLMEBOT_USER)
+# The night alarm (23:00 to 09:00 your time) has its own on/off button. It never rings for the
+# first read after a restart.
 # ============================================================
 
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()
-PUSHOVER_USER = os.getenv("PUSHOVER_USER", "").strip()
-PUSHOVER_BASE = os.getenv("PUSHOVER_BASE", "https://api.pushover.net/1").rstrip("/")
 CALLMEBOT_USER = os.getenv("CALLMEBOT_USER", "").strip()
 CALLMEBOT_BASE = os.getenv("CALLMEBOT_BASE", "https://api.callmebot.com").rstrip("/")
-ALARM_REPEAT_SECONDS = max(15, int(float(os.getenv("ALARM_REPEAT_SECONDS", "45"))))
-ALARM_MAX_ROUNDS = max(1, int(float(os.getenv("ALARM_MAX_ROUNDS", "8"))))
-ALARM_MAX_PER_HOUR = 6
+ALARM_REPEAT_SECONDS = max(5, int(float(os.getenv("ALARM_REPEAT_SECONDS", "10"))))
+ALARM_MAX_MINUTES = max(0.0, float(os.getenv("ALARM_MAX_MINUTES", "180")))     # safety stop, 0 = never
+ALARM_CALL_EVERY = 180             # seconds between phone calls while it rings
 ALARM_ASYNC = True                 # the alarm runs on its own thread so the stock checks never wait for it
-ALARM = {"acked": False, "running": False, "receipt": "", "starts": []}
+ALARM = {"acked": False, "running": False, "headline": "", "buy": "", "ids": []}
+NIGHT_HOURS = "23-9"
 
 
 def alarm_settings():
     settings = META.get("alarm")
     if not isinstance(settings, dict):
-        settings = {"on": False, "hours": ""}
+        settings = {"on": False, "hours": NIGHT_HOURS}
         META["alarm"] = settings
+    elif settings == {"on": False, "hours": ""}:          # the old default: start with the night alarm
+        settings["hours"] = NIGHT_HOURS
     return settings
 
 
@@ -2111,36 +2110,17 @@ def in_alarm_hours(now=None):
     return (start <= hour < end) if start < end else (hour >= start or hour < end)
 
 
-def alarm_should_ring():
+def alarm_active():
+    """The alarm is on and it is inside its hours."""
+    return bool(alarm_settings().get("on")) and in_alarm_hours()
+
+
+def alarm_mode():
     settings = alarm_settings()
-    if not settings.get("on") or not in_alarm_hours() or ALARM["running"]:
-        return False
-    now = time.time()
-    ALARM["starts"] = [t for t in ALARM["starts"] if now - t < 3600]
-    return len(ALARM["starts"]) < ALARM_MAX_PER_HOUR
-
-
-def pushover_alarm(title, message, url):
-    """Sends a Pushover emergency alert (repeats every 60 s until acknowledged). Returns its receipt."""
-    if not (PUSHOVER_TOKEN and PUSHOVER_USER):
-        return ""
-    data = urllib.parse.urlencode({
-        "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "title": title[:250], "message": message[:1000],
-        "priority": 2, "retry": 60, "expire": 900, "sound": "siren", "url": url, "url_title": "Buy now",
-    }).encode("utf-8")
-    request = urllib.request.Request(f"{PUSHOVER_BASE}/messages.json", data=data, method="POST")
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return str(json.loads(response.read().decode("utf-8")).get("receipt") or "")
-
-
-def pushover_cancel(receipt):
-    if not (receipt and PUSHOVER_TOKEN):
-        return
-    data = urllib.parse.urlencode({"token": PUSHOVER_TOKEN}).encode("utf-8")
-    request = urllib.request.Request(f"{PUSHOVER_BASE}/receipts/{urllib.parse.quote(receipt)}/cancel.json",
-                                     data=data, method="POST")
-    with urllib.request.urlopen(request, timeout=15) as response:
-        response.read()
+    if not settings.get("on"):
+        return "off"
+    hours = settings.get("hours") or ""
+    return "night" if hours == NIGHT_HOURS else ("always" if hours == "" else "custom")
 
 
 def callmebot_call(text):
@@ -2173,111 +2153,290 @@ def ack_alarm():
 
 
 def alarm_run(items, test=False):
-    """Runs one alarm: outside layers once, then Telegram wake-up messages until you tap 'I'm up',
-    the stock is gone, or the rounds run out."""
-    ids = [it["id"] for it in items]
-    headline = "TEST · this is only a test" if test else alarm_headline(items)
-    buy = SITE if test else items[0]["cart_url"]
-    rounds = 2 if test else ALARM_MAX_ROUNDS
-    ALARM.update(acked=False, running=True, receipt="")
+    """One alarm. Wake-up messages every few seconds with no limit until you tap 'I'm awake'
+    (a test stops after 3, and a safety stop ends it after ALARM_MAX_MINUTES)."""
+    ALARM.update(acked=False, running=True, ids=[it["id"] for it in items],
+                 headline="TEST · this is only a test" if test else alarm_headline(items),
+                 buy=SITE if test else items[0]["cart_url"])
+    max_messages = 3 if test else (int(ALARM_MAX_MINUTES * 60 / ALARM_REPEAT_SECONDS) if ALARM_MAX_MINUTES else 0)
+    call_every = max(1, int(ALARM_CALL_EVERY / ALARM_REPEAT_SECONDS))
+    started = time.time()
+    number = 0
+    outcome = "acked"
     try:
-        try:
-            ALARM["receipt"] = pushover_alarm("Knife Mfg Co: IN STOCK" if not test else "Knife Mfg Co: test alarm",
-                                              headline, buy)
-        except Exception as e:
-            log(f"Pushover alarm failed: {e}")
-        try:
-            callmebot_call("Knife M F G drop! " + headline if not test else "This is a test of your drop alarm.")
-        except Exception as e:
-            log(f"CallMeBot call failed: {e}")
-
-        outcome = "rounds"
-        for number in range(1, rounds + 1):
-            markup = {"inline_keyboard": [
-                [{"text": btn("⚡ Buy now"), "url": buy}],
-                [{"text": btn("✅ I'm up"), "callback_data": "al:ack"}],
-            ]}
-            send_text(f"🚨 <h>WAKE UP</h>\n{LINE}\n{esc(headline)}\n"
-                      + ("This is only a test." if test else "In stock right now.") + f" ({number}/{rounds})", markup)
+        while not ALARM["acked"]:
+            if max_messages and number >= max_messages:
+                outcome = "stopped"
+                break
+            number += 1
+            if number == 1 or number % call_every == 0:
+                try:
+                    callmebot_call("This is a test of your drop alarm." if test
+                                   else "Knife M F G drop! " + ALARM["headline"])
+                except Exception as e:
+                    log(f"CallMeBot call failed: {e}")
+            sold = (not test) and alarm_gone(ALARM["ids"])
+            send_text(
+                f"🚨🚨 <h>WAKE UP</h> 🚨🚨\n{LINE}\n{esc(ALARM['headline'])}\n"
+                + ("This is only a test." if test else ("💨 It may be sold out already." if sold else "In stock right now."))
+                + f"\n#{number} · ringing for {human(time.time() - started)}",
+                {"inline_keyboard": [
+                    [{"text": btn("⚡ Buy now"), "url": ALARM["buy"]}],
+                    [{"text": btn("✅ I'm awake"), "callback_data": "al:ack"}],
+                ]},
+            )
             for _ in range(ALARM_REPEAT_SECONDS):
                 if ALARM["acked"]:
-                    outcome = "acked"
-                    break
-                if not test and alarm_gone(ids):
-                    outcome = "gone"
                     break
                 time.sleep(1)
-            if outcome != "rounds":
-                break
-        try:
-            pushover_cancel(ALARM["receipt"])
-        except Exception as e:
-            log(f"Pushover cancel failed: {e}")
         if outcome == "acked":
             send_text("✅ <h>Alarm off</h>\n" + LINE + "\nGood luck!")
-        elif outcome == "gone":
-            send_text("🏁 <h>Gone</h>\n" + LINE + "\nIt sold out while the alarm was ringing. Check /history for how fast.")
         else:
-            send_text("⏹ <h>Alarm stopped</h>\n" + LINE + f"\nNo answer after {rounds} rounds. /alarm off turns it off.")
+            send_text("⏹ <h>Alarm stopped</h>\n" + LINE
+                      + ("\nThat was the test." if test else f"\nNo answer for {human(time.time() - started)}, so I stopped "
+                         "as a safety. Tap Alarm in /panel to check it."))
     finally:
         ALARM["running"] = False
 
 
 def ring_alarm(items, test=False):
-    """Called right after a drop alert was delivered. Does nothing unless /alarm on and inside the hours."""
+    """Called right after a drop alert was delivered. Does nothing unless the alarm is on and inside its hours.
+    If an alarm is already ringing, it just switches to the newest drop."""
     if not test:
-        if not alarm_should_ring():
+        if not alarm_active():
             return
-        ALARM["starts"].append(time.time())
+        if ALARM["running"]:
+            ALARM.update(ids=[it["id"] for it in items], headline=alarm_headline(items), buy=items[0]["cart_url"])
+            return
+    elif ALARM["running"]:
+        return
     if ALARM_ASYNC:
         threading.Thread(target=alarm_run, args=(items, test), daemon=True).start()
     else:
         alarm_run(items, test)
 
 
-def alarm_status_text():
-    settings = alarm_settings()
-    hours = settings.get("hours") or ""
-    lines = [
-        "🚨 <h>Alarm</h>", LINE,
-        "It is <b>" + ("on" if settings.get("on") else "off") + "</b>"
-        + (f", only between {esc(hours.replace('-', ':00 and '))}:00 your time" if hours else ", at any hour") + ".",
-        "",
-        "<b>How it wakes you</b>",
-        "✅ Telegram wake-up messages, repeated until you tap I'm up",
-        ("✅" if PUSHOVER_TOKEN and PUSHOVER_USER else "⬜") + " Pushover emergency alert (breaks through Silent)",
-        ("✅" if CALLMEBOT_USER else "⬜") + " Telegram voice call (CallMeBot)",
+def edit_message(query, text, markup):
+    """Redraws the message a button was tapped on."""
+    telegram_api("editMessageText", {
+        "chat_id": str(query.get("message", {}).get("chat", {}).get("id", "")),
+        "message_id": query["message"]["message_id"],
+        "text": render(text),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+        "reply_markup": json.dumps(markup),
+    })
+
+
+def hours_label(hours):
+    window = parse_hours(hours or "")
+    if window is None:
+        return "any hour"
+    return f"{window[0]:02d}:00 to {window[1] % 24:02d}:00 (your time)"
+
+
+def alarm_summary():
+    """One line for the panel and the alarm screen."""
+    mode = alarm_mode()
+    hours = alarm_settings().get("hours")
+    if mode == "off":
+        return "🔕 Alarm off"
+    if mode == "night":
+        return f"🌙 Night alarm on · {hours_label(hours)}"
+    if mode == "always":
+        return "🔔 Alarm on · any hour"
+    return f"🔔 Alarm on · {hours_label(hours)}"
+
+
+def alarm_text():
+    return "\n".join([
+        "🚨 <h>Alarm</h>",
         LINE,
-        "<b>/alarm on</b> or <b>/alarm off</b>",
-        "<b>/alarm hours 23-9</b> only between 23:00 and 09:00, or <b>/alarm hours all</b>",
-        "<b>/alarm test</b> rings a test alarm now",
-    ]
-    return "\n".join(lines)
+        alarm_summary(),
+        ("📞 Phone call: ready" if CALLMEBOT_USER else "📞 Phone call: not set up"),
+        LINE,
+        f"When a drop lands I send wake-up messages every {ALARM_REPEAT_SECONDS} seconds, with no limit, "
+        "until you tap I'm awake.",
+    ])
+
+
+def alarm_markup():
+    mode = alarm_mode()
+    return {"inline_keyboard": [
+        [{"text": btn(f"🌙 Night alarm 23:00-09:00: {'On' if mode == 'night' else 'Off'}"), "callback_data": "al:night"}],
+        [{"text": btn(f"🔔 Any hour: {'On' if mode == 'always' else 'Off'}"), "callback_data": "al:always"},
+         {"text": btn("🧪 Test"), "callback_data": "al:test"}],
+        [{"text": btn("◀ Panel"), "callback_data": "pn:home"}],
+    ]}
+
+
+def test_alarm_items():
+    return [{"id": "test", "product": "Test Deck", "shape": "KH1", "handle": "test", "cart_url": SITE}]
+
+
+def handle_alarm_tap(query, data):
+    """A button on the alarm screen. Returns the little pop-up text."""
+    key = data[3:]
+    settings = alarm_settings()
+    if key == "night":
+        if alarm_mode() == "night":
+            settings["on"], toast = False, "Night alarm off"
+        else:
+            settings["on"], settings["hours"], toast = True, NIGHT_HOURS, "Night alarm on 🌙"
+    elif key == "always":
+        if alarm_mode() == "always":
+            settings["on"], toast = False, "Alarm off"
+        else:
+            settings["on"], settings["hours"], toast = True, "", "Alarm on at any hour 🔔"
+    elif key == "on":                                   # older buttons still in the chat
+        settings["on"], toast = True, "Alarm on"
+    elif key == "off":
+        settings["on"], toast = False, "Alarm off"
+    elif key.startswith("h:"):
+        value = key[2:]
+        try:
+            parse_hours(value)
+        except Exception:
+            return "✓"
+        settings["hours"], toast = ("" if value == "all" else value), "Hours set"
+    elif key == "test":
+        ring_alarm(test_alarm_items(), test=True)
+        toast = "Test alarm started"
+    else:
+        return "✓"
+    save_meta()
+    edit_message(query, alarm_text(), alarm_markup())
+    return toast
 
 
 def handle_alarm(argument):
+    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test."""
     parts = argument.strip().lower().split()
     settings = alarm_settings()
-    if not parts:
-        send_text(alarm_status_text())
-        return
-    if parts[0] in ("on", "off"):
+    if parts and parts[0] in ("on", "off"):
         settings["on"] = parts[0] == "on"
         save_meta()
-        send_text(alarm_status_text())
-    elif parts[0] == "hours" and len(parts) >= 2:
+    elif parts and parts[0] == "night":
+        settings["on"], settings["hours"] = True, NIGHT_HOURS
+        save_meta()
+    elif parts and parts[0] == "hours" and len(parts) >= 2:
         try:
             parse_hours(parts[1])
         except Exception:
-            send_text("🤔 Try <b>/alarm hours 23-9</b> (24-hour clock) or <b>/alarm hours all</b>.")
+            send_text("🤔 Try <b>/alarm hours 23-9</b> (24-hour clock) or tap a button below.", alarm_markup())
             return
         settings["hours"] = "" if parts[1] in ("all", "always") else parts[1]
         save_meta()
-        send_text(alarm_status_text())
-    elif parts[0] == "test":
-        ring_alarm([{"id": "test", "product": "Test Deck", "shape": "KH1", "handle": "test", "cart_url": SITE}], test=True)
+    elif parts and parts[0] == "test":
+        ring_alarm(test_alarm_items(), test=True)
+        return
+    elif parts:
+        send_text("🤔 I didn't understand that. Use the buttons below.", alarm_markup())
+        return
+    send_text(alarm_text(), alarm_markup())
+
+
+# ============================================================
+# CONTROL PANEL: everything on buttons
+# ============================================================
+
+def smart_on():
+    return bool(META.get("smart", True))
+
+
+def panel_text():
+    settings = alarm_settings()
+    fast = fast_now()
+    return "\n".join([
+        "🎛 <h>Control panel</h>",
+        LINE,
+        (f"⚡ Drop mode on · every {current_interval():g}s" if fast else f"🐢 Calm · every {current_interval():g}s"),
+        alarm_summary(),
+        ("🔮 Smart drop on" if smart_on() else "🔮 Smart drop off"),
+    ])
+
+
+def panel_markup():
+    def state(label, on):
+        return btn(f"{label}: {'On' if on else 'Off'}")
+    radar = radar_markup()
+    radar_button = radar["inline_keyboard"][0][0] if radar else {"text": btn("📈 Live radar"), "callback_data": "pn:radar"}
+    return {"inline_keyboard": [
+        [{"text": btn("📡 Status"), "callback_data": "pn:status"}, radar_button],
+        [{"text": state("⚡ Drop mode", fast_now()), "callback_data": "pn:drop"},
+         {"text": state("🚨 Alarm", alarm_settings().get("on")), "callback_data": "pn:alarm"}],
+        [{"text": state("🔮 Smart drop", smart_on()), "callback_data": "pn:smart"},
+         {"text": btn("⚙ Alarm settings"), "callback_data": "pn:alarmset"}],
+        [{"text": btn("✅ Ready check"), "callback_data": "pn:ready"},
+         {"text": btn("👀 Watching"), "callback_data": "pn:watch"}],
+        [{"text": btn("🏆 Pickups"), "callback_data": "pn:stats"},
+         {"text": btn("📦 Parcels"), "callback_data": "pn:parcels"}],
+        [{"text": btn("📜 History"), "callback_data": "pn:history"},
+         {"text": btn("🔮 Forecast"), "callback_data": "pn:forecast"}],
+        [{"text": btn("❔ Help"), "callback_data": "pn:help"}],
+    ]}
+
+
+def send_panel():
+    send_text(panel_text(), panel_markup())
+
+
+def handle_panel_tap(query, data):
+    """A button on the control panel. Switches redraw the panel, the others open their own message."""
+    key = data[3:]
+    if key == "drop":
+        if fast_now():
+            end_drop()
+            toast = "Calm mode"
+        else:
+            start_drop(DROP_MANUAL_MINUTES, sticky=True)
+            toast = "Drop mode on ⚡"
+    elif key == "alarm":
+        settings = alarm_settings()
+        settings["on"] = not settings.get("on")
+        save_meta()
+        toast = "Alarm on" if settings["on"] else "Alarm off"
+    elif key == "smart":
+        META["smart"] = not smart_on()
+        save_meta()
+        toast = "Smart drop on" if META["smart"] else "Smart drop off"
+    elif key == "alarmset":
+        edit_message(query, alarm_text(), alarm_markup())
+        return "Alarm settings"
+    elif key == "home":
+        edit_message(query, panel_text(), panel_markup())
+        return "Panel"
+    elif key == "status":
+        send_text(status_text(), status_markup())
+        return "Status ⬇"
+    elif key == "radar":
+        handle_radar()
+        return "Live radar ⬇"
+    elif key == "ready":
+        send_text(ready_text(), ready_markup())
+        return "Ready check ⬇"
+    elif key == "watch":
+        handle_watch("")
+        return "Watching ⬇"
+    elif key == "stats":
+        send_text(stats_text())
+        return "Pickups ⬇"
+    elif key == "parcels":
+        send_text(parcels_text())
+        return "Parcels ⬇"
+    elif key == "history":
+        send_text(history_text())
+        return "History ⬇"
+    elif key == "forecast":
+        send_text(forecast_text())
+        return "Forecast ⬇"
+    elif key == "help":
+        send_text(help_text(), help_markup())
+        return "Help ⬇"
     else:
-        send_text("🤔 Try <b>/alarm</b>, <b>/alarm on</b>, <b>/alarm off</b>, <b>/alarm hours 23-9</b> or <b>/alarm test</b>.")
+        return "✓"
+    edit_message(query, panel_text(), panel_markup())
+    return toast
 
 
 # ============================================================
@@ -2970,10 +3129,11 @@ def status_markup():
 
 
 def help_markup():
-    return {"inline_keyboard": [[
-        {"text": btn("📡 Status"), "callback_data": "refresh"},
-        {"text": btn("🛒 Open shop"), "url": SITE},
-    ]]}
+    return {"inline_keyboard": [
+        [{"text": btn("🎛 Control panel"), "callback_data": "pn:home"}],
+        [{"text": btn("📡 Status"), "callback_data": "refresh"},
+         {"text": btn("🛒 Open shop"), "url": SITE}],
+    ]}
 
 
 def status_text():
@@ -3044,38 +3204,28 @@ def help_text():
     return (
         "📡 <h>KNIFE MFG CO · deck radar</h>\n"
         f"{LINE}\n"
-        "I watch the shop 24/7 and ping you the second a deck is back.\n"
-        "\n"
         f"{shapes}\n"
         "\n"
+        "Tap /panel for buttons. Every command also works typed.\n"
+        "\n"
         "<h>Stock</h>\n"
-        "/status — stock right now\n"
-        "/radar — live radar page\n"
-        "/ready — drop-day checklist\n"
-        "/alarm — wake me up when a drop lands\n"
-        "/watch NAME — alerts for a deck by name\n"
-        "/unwatch NAME — stop watching\n"
-        "/drop — fast checking (/drop 45, /drop 20:00)\n"
-        "/calm — back to calm checking\n"
-        "/forecast — when drops usually happen\n"
-        "/history — past drops\n"
-        "/smart — smart drop on or off\n"
+        "/status · /panel · /radar · /ready\n"
+        "\n"
+        "<h>Speed</h>\n"
+        "/drop (/drop 45, /drop 20:00) · /calm\n"
+        "/smart · /forecast · /history\n"
+        "\n"
+        "<h>Alerts</h>\n"
+        "/alarm · /watch NAME · /unwatch NAME\n"
         "\n"
         "<h>Buying</h>\n"
-        "/stats — my pickups\n"
-        "/bought — add a pickup\n"
-        "/undo — remove the last one\n"
+        "/stats · /bought · /undo\n"
         "\n"
         "<h>Parcels</h>\n"
-        "/parcels — on their way\n"
-        "/track NUMBER — follow a parcel\n"
-        "/untrack NUMBER — stop following\n"
+        "/parcels · /track NUMBER · /untrack NUMBER\n"
         "\n"
-        "<h>Other</h>\n"
-        "/password WORD — shop password\n"
-        "/test — sample alert\n"
-        "/info — version and settings\n"
-        "/help — this screen\n"
+        "<h>More</h>\n"
+        "/password WORD · /test · /info · /help\n"
         f"{LINE}\n"
         f"🟢 online · {mode_line()}\n"
         f"💱 prices ≈ S$ (1 USD = {FX['rate']:.2f})"
@@ -3502,7 +3652,9 @@ def handle_ready_tap(query, data):
 def handle_command(command):
     if command == "/status":
         send_text(status_text(), status_markup())
-    elif command in ("/help", "/start"):
+    elif command == "/start":
+        send_panel()
+    elif command == "/help":
         send_text(help_text(), help_markup())
     elif command == "/test":
         send_test_alert()
@@ -3518,6 +3670,8 @@ def handle_command(command):
         send_text(ready_text(), ready_markup())
     elif command == "/alarm":
         handle_alarm("")
+    elif command == "/panel":
+        send_panel()
     elif command == "/history":
         send_text(history_text())
     elif command == "/parcels":
@@ -3545,6 +3699,10 @@ def handle_callback(query):
         toast = handle_ready_tap(query, data)
     elif data == "al:ack":
         toast = ack_alarm()
+    elif data.startswith("al:"):
+        toast = handle_alarm_tap(query, data)
+    elif data.startswith("pn:"):
+        toast = handle_panel_tap(query, data)
     elif data == "undo:yes":
         handle_undo(True)
         toast = "Removed ✓"
@@ -3651,6 +3809,7 @@ def telegram_listener(offset):
 
 # Every command, in the order of the Menu button in Telegram.
 MENU_COMMANDS = [
+    ("panel", "Control panel with buttons"),
     ("status", "Stock right now"),
     ("alarm", "Wake me up when a drop lands"),
     ("ready", "Drop-day checklist"),
