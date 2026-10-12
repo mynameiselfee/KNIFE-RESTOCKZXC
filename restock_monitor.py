@@ -55,7 +55,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.3 (11 Oct 2026)"
+VERSION = "4.4 (11 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "12")))   # calm mode: easy on the shop
@@ -1411,6 +1411,8 @@ footer{text-align:center;font-size:11px;color:var(--dim);margin-top:14px}
 .bigbtn:active{transform:scale(.98)}
 .bigbtn small{display:block;font-size:13px;font-weight:500;margin-top:8px;opacity:.8}
 .bigbtn.dark{background:var(--text);color:var(--bg)}
+.mock{border:1px solid var(--line);border-radius:18px;padding:14px 16px;background:var(--surface);font-size:14px;line-height:1.9;margin-bottom:12px;color:var(--dim)}
+.mock .mockTitle{color:var(--text);font-weight:650;margin-bottom:2px}
 .xbtn{font-family:inherit;background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:16px;min-height:48px;font-size:14px;font-weight:600}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
@@ -1629,7 +1631,7 @@ footer{text-align:center;font-size:11px;color:var(--dim);margin-top:14px}
   function renderDrill(s) {
     var d = s.drill, txt;
     function sec(ms) { return ms ? (ms / 1000).toFixed(1) + " s" : "--"; }
-    if (!d.count) txt = "Race the clock: tap the size, pay, confirm. The clock is how fast " + d.shape + " really sells out (about " + dur(d.limit) + ").";
+    if (!d.count) txt = "Race the clock: tap the size, then pay at the shop. The clock is how fast " + d.shape + " really sells out (about " + dur(d.limit) + ").";
     else txt = "Best " + sec(d.best) + " · average " + sec(d.avg) + " · " + d.count + " drill" + (d.count === 1 ? "" : "s") + "\n" + d.shape + " really sells out in about " + dur(d.limit);
     $("drillStats").textContent = txt;
   }
@@ -1663,9 +1665,22 @@ footer{text-align:center;font-size:11px;color:var(--dim);margin-top:14px}
 
       function draw() {
         while (area.firstChild) area.removeChild(area.firstChild);
-        if (stage === 1) area.appendChild(button(shape + "\n(tap the size)", "bigbtn", function () { stage = 2; haptic("warning"); draw(); }));
-        else if (stage === 2) area.appendChild(button("Pay with Apple Pay\n(tap to pay)", "bigbtn dark", function () { stage = 3; haptic("warning"); draw(); }));
-        else area.appendChild(button("Confirm with Face ID\n(tap to confirm)", "bigbtn dark", function () { finish(true); }));
+        if (stage === 1) {
+          area.appendChild(button(shape + "\n(tap the size)", "bigbtn", function () {
+            stage = 2; haptic("warning"); draw();
+            drillTimers.push(setTimeout(function () { if (!finished) { stage = 3; draw(); } }, 1200));
+          }));
+        } else if (stage === 2) {
+          area.appendChild(el("div", "dtext", "Opening the shop checkout…"));
+        } else {
+          var mock = el("div", "mock");
+          mock.appendChild(el("div", "mockTitle", "Shop checkout"));
+          mock.appendChild(el("div", "", "Contact · filled in ✓"));
+          mock.appendChild(el("div", "", "Shipping address · filled in ✓"));
+          mock.appendChild(el("div", "", "Payment · paid at the shop"));
+          area.appendChild(mock);
+          area.appendChild(button("Pay now\n(tap to pay at the shop)", "bigbtn dark", function () { finish(true); }));
+        }
       }
 
       function finish(won) {
