@@ -55,7 +55,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.5 (12 Oct 2026)"
+VERSION = "4.6 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -192,7 +192,7 @@ STATE = {}               # variant_id -> was in stock when last alerted/seen
 CURRENT_SNAPSHOT = {}    # variant_id -> item dict
 DATA_LOCK = threading.Lock()
 LAST_CHECK = 0.0         # when the shop was last read successfully
-META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0}
+META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "ready": {}}
 
 
 def _write_json(path, data):
@@ -537,11 +537,34 @@ def _read(response):
     return raw
 
 
+CONDITIONAL = {}                      # page address -> (etag, body, final address)
+REQ = {"sent": 0, "unchanged": 0}     # how many shop requests were made, and how many came back "unchanged"
+
+
 def fetch_page(url, timeout=20):
-    """(bytes, final_url). A redirect to /password shows in the final URL."""
-    request = urllib.request.Request(url, headers=HEADERS)
-    with OPENER.open(request, timeout=timeout) as response:
-        return _read(response), response.geturl()
+    """(bytes, final_url). A redirect to /password shows in the final URL.
+    If the shop gave an ETag last time, asks "has it changed?" first. An unchanged page (a 304)
+    costs the shop almost nothing, which keeps the radar polite."""
+    key = url if "&_=" not in url else None            # a cache-busted address is always new
+    headers = dict(HEADERS)
+    cached = CONDITIONAL.get(key) if key else None
+    if cached:
+        headers["If-None-Match"] = cached[0]
+    request = urllib.request.Request(url, headers=headers)
+    REQ["sent"] += 1
+    try:
+        with OPENER.open(request, timeout=timeout) as response:
+            body, etag, final = _read(response), response.headers.get("ETag"), response.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached:
+            REQ["unchanged"] += 1
+            return cached[1], cached[2]
+        raise
+    if key and etag and urllib.parse.urlparse(final).path.rstrip("/") != "/password":
+        CONDITIONAL[key] = (etag, body, final)
+        while len(CONDITIONAL) > 8:
+            CONDITIONAL.pop(next(iter(CONDITIONAL)))
+    return body, final
 
 
 def post_password(password, timeout=20):
@@ -671,8 +694,21 @@ def extract_shape(title):
     return None
 
 
+WATCH_LIMIT = 10
+
+
+def watch_match(product_title, watches=None):
+    """The first watched name found in this product's title, or None."""
+    low = str(product_title or "").lower()
+    for name in (META.get("watches") if watches is None else watches) or []:
+        if name.lower() in low:
+            return name
+    return None
+
+
 def build_snapshot(products):
     snapshot = {}
+    watches = list(META.get("watches") or [])
     for product in products:
         name = product.get("title", "Unknown Product")
         handle = product.get("handle", "")
@@ -683,16 +719,19 @@ def build_snapshot(products):
         for variant in product.get("variants", []):
             vid = str(variant.get("id", ""))
             shape = extract_shape(variant.get("title", ""))
-            if not vid or not shape:
-                continue
             title = variant.get("title", "")
+            watched = watch_match(name, watches)
+            if not vid or not (shape or watched):
+                continue
             snapshot[vid] = {
                 "id": vid,
                 "product": name,
                 "handle": handle or name,
                 "variant": title,
-                "size": re.sub(rf"\b{shape}\b", "", title, flags=re.I).strip(" -/·"),
-                "shape": shape,
+                "size": re.sub(rf"\b{shape}\b", "", title, flags=re.I).strip(" -/·") if shape else "",
+                "shape": shape or (title or "variant"),          # a watched size is labelled by its own name
+                "watch": bool(watched and not shape),
+                "watch_name": watched or "",
                 "price": variant.get("price", ""),
                 "available": bool(variant.get("available", False)),
                 "image": image,
@@ -914,18 +953,21 @@ def alert_buttons(group, test=False):
         else:
             buttons.append({"text": btn(f"✖ {label}"), "callback_data": f"so:{shape}"})
 
-    first = next(iter(live.values()))
+    first = next(iter(live.values())) if live else group[0]
     ids = [it["id"] for it in group]
     while len("b:" + ",".join(ids)) > 64 and len(ids) > 1:
         ids.pop()
     bought = {"text": btn("✅ I bought it"), "callback_data": "b:test" if test else "b:" + ",".join(ids)}
-    return {"inline_keyboard": [
-        buttons[0:2],
-        buttons[2:4],
+    rows = [buttons[0:2], buttons[2:4]] if any(it.get("watch") is not True for it in group) else []
+    extra = [{"text": btn(f"⚡ {it['shape']}"), "url": it["cart_url"]}
+             for it in group if it.get("watch")]
+    rows += [extra[i:i + 2] for i in range(0, len(extra), 2)]
+    rows += [
         [{"text": btn("🔗 Open page"), "url": first["product_url"]},
          {"text": btn("🛒 Cart page"), "url": first["cart_page_url"]}],
         [bought],
-    ]}
+    ]
+    return {"inline_keyboard": rows}
 
 
 def send_alert(group, test=False):
@@ -2747,6 +2789,20 @@ def status_text():
         else:
             lines.append(f"⚫ <b>{shape}</b> · sold out")
 
+    watches = META.get("watches") or []
+    if watches:
+        lines.append(LINE)
+        for name in watches:
+            hits = [it for it in snapshot.values() if it.get("watch_name") == name and it["available"]]
+            seen = any(it.get("watch_name") == name for it in snapshot.values()) or any(
+                name.lower() in it["product"].lower() for it in snapshot.values())
+            if hits:
+                lines.append(f"👀 <b>{esc(name)}</b> · {len(hits)} in stock")
+                for it in hits[:3]:
+                    lines.append(f"      ▸ {esc(it['product'])} · {esc(it['shape'])}")
+            else:
+                lines.append(f"👀 <b>{esc(name)}</b> · " + ("sold out" if seen else "no match yet"))
+
     lines.append(LINE)
     age = time.time() - last_check
     if age > max(30, CHECK_INTERVAL * 6):
@@ -2775,6 +2831,9 @@ def help_text():
         "<h>Stock</h>\n"
         "/status — stock right now\n"
         "/radar — live radar page\n"
+        "/ready — drop-day checklist\n"
+        "/watch NAME — alerts for a deck by name\n"
+        "/unwatch NAME — stop watching\n"
         "/drop — fast checking (/drop 45, /drop 20:00)\n"
         "/calm — back to calm checking\n"
         "/forecast — when drops usually happen\n"
@@ -3060,9 +3119,161 @@ def info_text():
         f"fonts: headings {FONT_STYLE}, buttons {BUTTON_STYLE or FONT_STYLE}",
         f"watching {', '.join(SHAPES)}",
         "live radar page: " + (public_url() if LIVE_RADAR and public_url() else "needs a Railway domain (see /radar)"),
+        f"shop requests: {REQ['sent']} · answered \"unchanged\": {REQ['unchanged']}",
         f"tracking: USPS keys {'yes' if usps_ready() else 'no'} · Parcels key {'yes' if PARCELS_KEY else 'no'}"
         + (f"\n⚠️ last tracking problem: {esc(TRACK_HEALTH['error'])}" if TRACK_HEALTH["error"] else ""),
     ])
+
+
+def handle_watch(argument):
+    """/watch              lists what you watch
+       /watch All Over     alerts for any size of a deck with that name"""
+    name = re.sub(r"\s+", " ", argument).strip()
+    watches = META.setdefault("watches", [])
+    if not name:
+        if watches:
+            body = "\n".join(f"👀 <b>{esc(w)}</b>" for w in watches)
+        else:
+            body = "Nothing yet."
+        send_text(
+            f"👀 <h>Watching</h>\n{LINE}\n{body}\n{LINE}\n"
+            "<b>/watch All Over</b> alerts you for any size of a deck with that name.\n"
+            "<b>/unwatch All Over</b> stops it."
+        )
+        return
+    if not 2 <= len(name) <= 40:
+        send_text("🤔 A name should be 2 to 40 characters.")
+        return
+    if any(w.lower() == name.lower() for w in watches):
+        send_text(f"👀 I'm already watching <b>{esc(name)}</b>.")
+        return
+    if len(watches) >= WATCH_LIMIT:
+        send_text(f"👀 That's {WATCH_LIMIT} names already. Use /unwatch to free one.")
+        return
+    watches.append(name)
+    save_meta()
+    send_text(
+        f"👀 <h>Watching {esc(name)}</h>\n{LINE}\n"
+        "Any size of a deck with that name. If one is in stock now, or comes back, you get an alert. "
+        "Changes show from my next check."
+    )
+
+
+def handle_unwatch(argument):
+    name = re.sub(r"\s+", " ", argument).strip().lower()
+    watches = META.get("watches") or []
+    found = next((w for w in watches if w.lower() == name), None)
+    if not found:
+        send_text("🤔 I'm not watching that. See /watch.")
+        return
+    watches.remove(found)
+    save_meta()
+    send_text(f"👀 Stopped watching <b>{esc(found)}</b>.")
+
+
+# ============================================================
+# /ready: a drop-day checklist you can tap through
+# ============================================================
+
+READY_STEPS = [
+    ("password", "Shop password pasted in Safari", "Password"),
+    ("payment", "Payment ready at the shop", "Payment"),
+    ("alerts", "Telegram alerts switched on", "Alerts"),
+]
+CHECKOUT_REQUIRED = ["CHECKOUT_EMAIL", "CHECKOUT_FIRST_NAME", "CHECKOUT_LAST_NAME", "CHECKOUT_ADDRESS",
+                     "CHECKOUT_CITY", "CHECKOUT_ZIP", "CHECKOUT_COUNTRY"]
+
+
+def ready_state():
+    """What you have ticked. It clears itself after 12 hours, so each drop starts fresh."""
+    state = META.get("ready") or {}
+    if time.time() - float(state.get("t") or 0) > 12 * 3600:
+        state = {"t": time.time()}
+        META["ready"] = state
+    return state
+
+
+def ready_auto():
+    """The checks the bot can do by itself: (done, text)."""
+    checks = []
+    missing = [n[9:].lower() for n in CHECKOUT_REQUIRED if not os.getenv(n, "").strip()]
+    checks.append((not missing, "Checkout details filled in" if not missing
+                   else "Checkout details missing: " + ", ".join(missing)))
+    checks.append((fast_now(), "Drop mode on" if fast_now() else "Drop mode off (tap below)"))
+    fresh = LAST_CHECK and time.time() - LAST_CHECK < max(60, 4 * current_interval())
+    if HEALTH["error"]:
+        checks.append((False, "Shop check problem: " + HEALTH["error"]))
+    elif SHOP_LOCKED:
+        checks.append((True, "Shop is locked: I'm waiting for it to open"))
+    else:
+        checks.append((bool(fresh), "I'm checking the shop" if fresh else "No recent check yet"))
+    best = drill_stats()["best"]
+    checks.append((bool(best), f"Practiced a drill (best {best / 1000:.1f} s)" if best else "No practice drill yet (/radar)"))
+    checks.append((MEMORY_OK, "Memory saved" if MEMORY_OK else "Memory not saved: add a Volume at /data"))
+    return checks
+
+
+def ready_text():
+    state = ready_state()
+    lines = ["✅ <h>Ready check</h>", LINE, "<b>I checked</b>"]
+    todo = 0
+    for ok, text in ready_auto():
+        lines.append(("✅ " if ok else "⬜ ") + esc(text))
+        todo += 0 if ok else 1
+    lines.append("<b>You tick</b>")
+    for key, text, _short in READY_STEPS:
+        ok = bool(state.get(key))
+        lines.append(("✅ " if ok else "⬜ ") + esc(text))
+        todo += 0 if ok else 1
+    lines.append(LINE)
+    lines.append("🟢 <b>You're ready.</b> Good luck!" if todo == 0 else f"⚠️ {todo} to go")
+    return "\n".join(lines)
+
+
+def ready_markup():
+    state = ready_state()
+    tick = [{"text": btn(("✅ " if state.get(k) else "⬜ ") + short), "callback_data": f"rd:{k}"}
+            for k, _text, short in READY_STEPS]
+    rows = [tick[:2], tick[2:]]
+    action = []
+    if not fast_now():
+        action.append({"text": btn("⚡ Drop mode on"), "callback_data": "rd:drop"})
+    action.append({"text": btn("🛒 Open shop"), "url": SITE})
+    rows.append(action)
+    radar = radar_markup()
+    if radar:
+        rows.append(radar["inline_keyboard"][0])
+    rows.append([{"text": btn("↺ Start over"), "callback_data": "rd:reset"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_ready_tap(query, data):
+    """A tick, drop mode or reset from the checklist. Redraws the message. Returns the pop-up text."""
+    key = data[3:]
+    state = ready_state()
+    if key == "drop":
+        start_drop(DROP_MANUAL_MINUTES, sticky=True)
+        toast = "Drop mode on ⚡"
+    elif key == "reset":
+        META["ready"] = {"t": time.time()}
+        toast = "Cleared"
+    elif key in [k for k, _t, _s in READY_STEPS]:
+        state[key] = not state.get(key)
+        state["t"] = state.get("t") or time.time()
+        META["ready"] = state
+        toast = "Ticked ✓" if state[key] else "Unticked"
+    else:
+        return "✓"
+    save_meta()
+    telegram_api("editMessageText", {
+        "chat_id": str(query.get("message", {}).get("chat", {}).get("id", "")),
+        "message_id": query["message"]["message_id"],
+        "text": render(ready_text()),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+        "reply_markup": json.dumps(ready_markup()),
+    })
+    return toast
 
 
 def handle_command(command):
@@ -3080,6 +3291,8 @@ def handle_command(command):
         send_text(forecast_text())
     elif command == "/radar":
         handle_radar()
+    elif command == "/ready":
+        send_text(ready_text(), ready_markup())
     elif command == "/history":
         send_text(history_text())
     elif command == "/parcels":
@@ -3103,6 +3316,8 @@ def handle_callback(query):
         toast = f"{data[3:]} is sold out right now."
     elif data.startswith(("b:", "c:")):
         toast = handle_bought_tap(data)
+    elif data.startswith("rd:"):
+        toast = handle_ready_tap(query, data)
     elif data == "undo:yes":
         handle_undo(True)
         toast = "Removed ✓"
@@ -3163,6 +3378,14 @@ def telegram_listener(offset):
                     continue
                 command = text.split()[0].lower().split("@")[0]
                 log(f"Command received: {command}")
+                if command == "/watch":
+                    parts = text.split(None, 1)
+                    handle_watch(parts[1] if len(parts) > 1 else "")
+                    continue
+                if command == "/unwatch":
+                    parts = text.split(None, 1)
+                    handle_unwatch(parts[1] if len(parts) > 1 else "")
+                    continue
                 if command == "/smart":
                     parts = text.split(None, 1)
                     handle_smart(parts[1] if len(parts) > 1 else "")
@@ -3198,9 +3421,12 @@ def telegram_listener(offset):
 # Every command, in the order of the Menu button in Telegram.
 MENU_COMMANDS = [
     ("status", "Stock right now"),
+    ("ready", "Drop-day checklist"),
     ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
     ("calm", "Back to calm checking"),
+    ("watch", "Alerts for a deck by name"),
+    ("unwatch", "Stop watching a name"),
     ("forecast", "When drops usually happen"),
     ("history", "Past drops and sell-out times"),
     ("smart", "Smart drop on or off"),
@@ -3365,7 +3591,7 @@ def main():
 
         # back off when the shop is struggling; a little jitter keeps the rhythm irregular
         base = current_interval() if fails <= 1 else min(60, current_interval() * 2 ** min(fails - 1, 4))
-        time.sleep(max(0, base + throttle + random.uniform(0, 0.4) - (time.time() - started)))
+        time.sleep(max(0, base * random.uniform(0.9, 1.3) + throttle - (time.time() - started)))
 
 
 if __name__ == "__main__":
