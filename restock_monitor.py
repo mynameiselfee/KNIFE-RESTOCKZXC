@@ -4,7 +4,7 @@ Watches knifemfg.co for KH1 / KL2 / KL1 / KB1 decks and alerts you on Telegram.
 
 Railway variables
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    required
-  CHECK_INTERVAL        seconds between checks in calm mode (default 12, minimum 2)
+  CHECK_INTERVAL        seconds between checks in calm mode (default 20, minimum 2)
   DROP_INTERVAL         seconds between checks in drop mode (default 4, minimum 2)
   DROP_MANUAL_MINUTES   how long /drop keeps drop mode on (default 180 = 3 hours)
   DROP_IDLE_MINUTES     automatic drop mode (restock, shop opens) goes back to calm after this long quiet (default 60)
@@ -55,10 +55,10 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.4 (11 Oct 2026)"
+VERSION = "4.5 (12 Oct 2026)"
 STARTED_AT = time.time()
 
-CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "12")))   # calm mode: easy on the shop
+CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
 DROP_INTERVAL = max(2.0, float(os.getenv("DROP_INTERVAL", "4")))      # drop mode: fast
 DROP_IDLE_MINUTES = max(5.0, float(os.getenv("DROP_IDLE_MINUTES", "60")))   # quiet this long = back to calm
 DROP_MANUAL_MINUTES = max(5.0, float(os.getenv("DROP_MANUAL_MINUTES", "180")))   # what /drop gives you
@@ -443,21 +443,78 @@ def mode_line():
     return f"🐢 calm mode · every {current_interval():g}s · /drop for fast"
 
 
+PACE_STEP = 4.0              # seconds added to the calm pace each time the shop says 429
+PACE_MAX_EXTRA = 40.0        # never more than this on top of the calm pace
+BLOCK = {"until": 0.0}       # the shop said wait: no checks before this time (kept across restarts)
+STREAK = {"since": 0.0, "hinted": False}     # how long the shop has been refusing in a row
+STREAK_HINT_AFTER = 1800     # after this long, suggest changing the Railway region
+
+
 def note_rate_limited():
-    PACE["extra"] = min(10.0, PACE["extra"] + 2.0)
+    PACE["extra"] = min(PACE_MAX_EXTRA, PACE["extra"] + PACE_STEP)
     PACE["last_limit"] = time.time()
     PACE["buster"] = False
+    META["pace_extra"], META["pace_t"] = PACE["extra"], PACE["last_limit"]
+    save_meta()
 
 
 def calm_down():
-    """Called after every good check. Gives back 1 second per 30 calm minutes."""
+    """Called after every good check. Gives back 2 seconds per 30 calm minutes."""
     if PACE["extra"] <= 0 and PACE["buster"] == (os.getenv("CACHE_BUSTER", "1") == "1"):
         return
     if time.time() - PACE["last_limit"] > 1800:
-        PACE["extra"] = max(0.0, PACE["extra"] - 1.0)
+        PACE["extra"] = max(0.0, PACE["extra"] - 2.0)
         PACE["last_limit"] = time.time()
         if PACE["extra"] == 0:
             PACE["buster"] = os.getenv("CACHE_BUSTER", "1") == "1"
+        META["pace_extra"], META["pace_t"] = PACE["extra"], PACE["last_limit"]
+        save_meta()
+
+
+def load_pace_state():
+    """After a restart, remember how gently the shop wants to be asked, and any pause it asked for."""
+    PACE["extra"] = min(PACE_MAX_EXTRA, max(0.0, float(META.get("pace_extra") or 0)))
+    PACE["last_limit"] = float(META.get("pace_t") or 0)
+    if PACE["extra"] > 0:
+        PACE["buster"] = False
+    BLOCK["until"] = float(META.get("blocked_until") or 0)
+
+
+def set_block(seconds):
+    BLOCK["until"] = time.time() + seconds
+    META["blocked_until"] = BLOCK["until"]
+    save_meta()
+
+
+def cooldown_remaining():
+    return max(0.0, BLOCK["until"] - time.time())
+
+
+def streak_note():
+    """Called on every refusal. After a long unbroken streak, says once what else can be done."""
+    now = time.time()
+    if not STREAK["since"]:
+        STREAK["since"] = now
+    if now - STREAK["since"] >= STREAK_HINT_AFTER and not STREAK["hinted"]:
+        STREAK["hinted"] = True
+        send_text(
+            "🌏 <h>Still blocked after 30 minutes</h>\n" + LINE + "\n"
+            "This looks like the shop limiting Railway's address, not my speed, so waiting won't fix it.\n"
+            "Try another region: Railway, your service, <b>Settings</b>, <b>Region</b>. "
+            "Pick a different one (Singapore is the closest), then deploy once."
+        )
+
+
+def streak_clear():
+    STREAK["since"] = 0.0
+    STREAK["hinted"] = False
+
+
+def retry_note():
+    left = cooldown_remaining()
+    if left > 0:
+        return f"🔁 next try in {human(left)}"
+    return f"🔁 still trying by myself, about every {current_interval():g}s or slower"
 
 
 class ShopLocked(FetchError):
@@ -2672,7 +2729,7 @@ def status_text():
         if HEALTH["error"]:
             return "\n".join(head + [
                 f"⚠️ I can't read the shop yet: {HEALTH['error']}",
-                f"🔁 still trying by myself, about every {current_interval():g}s or slower",
+                retry_note(),
                 "Alerts start as soon as it answers.",
             ])
         return "\n".join(head + ["⏳ warming up, try again in a few seconds"])
@@ -3199,22 +3256,29 @@ def main():
     DROP["until"] = float(META.get("drop_until") or 0)
     DROP["sticky"] = bool(META.get("drop_sticky"))
     _FAST["was"] = fast_now()
+    load_pace_state()
     refresh_fx()
     setup_telegram()
     offset = drop_stale_updates()
 
-    log("Performing initial stock check...")
-    try:
-        check_stock()
-    except ShopLocked as e:
-        note_locked(e.text)
-    except RateLimited:
-        note_rate_limited()
-        HEALTH["error"] = "the shop is limiting my checks (429)"
-        log("Initial check: the shop is rate limiting (429). The radar will keep trying.")
-    except Exception as e:
-        HEALTH["error"] = "the shop isn't answering"
-        log(f"Initial check failed: {e}")
+    if cooldown_remaining() > 0:
+        # the shop asked for a pause before this restart: a restart is not a reason to ask again at once
+        HEALTH["error"] = "the shop asked me to wait (429)"
+        log(f"The shop asked for a pause. First check in {cooldown_remaining():.0f}s.")
+    else:
+        log("Performing initial stock check...")
+        try:
+            check_stock()
+        except ShopLocked as e:
+            note_locked(e.text)
+        except RateLimited:
+            note_rate_limited()
+            set_block(20.0)
+            HEALTH["error"] = "the shop is limiting my checks (429)"
+            log("Initial check: the shop is rate limiting (429). The radar will keep trying.")
+        except Exception as e:
+            HEALTH["error"] = "the shop isn't answering"
+            log(f"Initial check failed: {e}")
 
     threading.Thread(target=telegram_listener, args=(offset,), daemon=True).start()
     threading.Thread(target=tracking_loop, daemon=True).start()
@@ -3228,7 +3292,8 @@ def main():
         lines = [
             "📡 <h>Deck radar online</h>",
             LINE,
-            f"🎯 tracking {total} variants · {live} in stock",
+            (f"🎯 tracking {total} variants · {live} in stock" if total
+             else "⏳ waiting for the shop to answer before the first check"),
             mode_line(),
         ]
         if not MEMORY_OK:
@@ -3253,9 +3318,14 @@ def main():
                 log(f"{housekeeping.__name__} failed: {e}")
         expire_password()
         maybe_daily_ping()
+        if cooldown_remaining() > 0:
+            time.sleep(min(cooldown_remaining(), 5.0))
+            continue
         try:
             check_stock()
             HEALTH["error"] = ""
+            streak_clear()
+            BLOCK["until"] = 0.0
             calm_down()
             throttle = throttle / 2 if throttle > 5 else 0.0
             limited = 0
@@ -3274,14 +3344,17 @@ def main():
             note_rate_limited()
             limited += 1
             throttle = min(300.0, max(e.retry_after, throttle * 2 if throttle else 20.0))
+            set_block(throttle)
             log(f"Shop is rate limiting (429). Waiting {throttle:.0f}s, then checking a little slower "
                 f"(every {current_interval():g}s). {limited} in a row.")
             if limited >= 3 and not limited_warned:
                 send_text(
                     "⚠️ <h>The shop is limiting my checks (429).</h>\n"
-                    "I'm slowing down by myself. Alerts can be a few seconds later until it calms down."
+                    f"I'm slowing down by myself: calm checks are now every {current_interval():g}s. "
+                    "Alerts can be a little later until it calms down."
                 )
                 limited_warned = True
+            streak_note()
         except Exception as e:
             fails += 1
             HEALTH["error"] = "the shop isn't answering"
