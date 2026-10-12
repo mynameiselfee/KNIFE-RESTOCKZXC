@@ -23,6 +23,8 @@ Railway variables
   USD_TO_SGD            fixed exchange rate instead of the live one (optional)
   CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
+  PUSHOVER_TOKEN / PUSHOVER_USER   optional: a real alarm that breaks through Silent and Focus (see /alarm)
+  CALLMEBOT_USER        optional: a Telegram voice call to your @username (see /alarm)
   PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
   LIVE_RADAR            0 turns the live radar page off
   RADAR_THEME           auto (follows Telegram, default), dark or light
@@ -55,7 +57,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.6 (12 Oct 2026)"
+VERSION = "4.7 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -192,7 +194,7 @@ STATE = {}               # variant_id -> was in stock when last alerted/seen
 CURRENT_SNAPSHOT = {}    # variant_id -> item dict
 DATA_LOCK = threading.Lock()
 LAST_CHECK = 0.0         # when the shop was last read successfully
-META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "ready": {}}
+META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "ready": {}, "alarm": {"on": False, "hours": ""}}
 
 
 def _write_json(path, data):
@@ -2061,6 +2063,224 @@ def handle_radar():
 
 
 # ============================================================
+# ALARM: wake me up when a drop lands
+# Telegram alone can't ring through Silent mode or a Sleep Focus, so the alarm uses three layers:
+#   1. Telegram wake-up messages that repeat every 45 seconds until you tap "I'm up"
+#   2. Pushover "emergency" alerts (optional): they repeat until acknowledged and can break through Silent
+#   3. A Telegram voice call from CallMeBot (optional)
+# It is off until you send /alarm on, and it never rings for the first read after a restart.
+# ============================================================
+
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "").strip()
+PUSHOVER_BASE = os.getenv("PUSHOVER_BASE", "https://api.pushover.net/1").rstrip("/")
+CALLMEBOT_USER = os.getenv("CALLMEBOT_USER", "").strip()
+CALLMEBOT_BASE = os.getenv("CALLMEBOT_BASE", "https://api.callmebot.com").rstrip("/")
+ALARM_REPEAT_SECONDS = max(15, int(float(os.getenv("ALARM_REPEAT_SECONDS", "45"))))
+ALARM_MAX_ROUNDS = max(1, int(float(os.getenv("ALARM_MAX_ROUNDS", "8"))))
+ALARM_MAX_PER_HOUR = 6
+ALARM_ASYNC = True                 # the alarm runs on its own thread so the stock checks never wait for it
+ALARM = {"acked": False, "running": False, "receipt": "", "starts": []}
+
+
+def alarm_settings():
+    settings = META.get("alarm")
+    if not isinstance(settings, dict):
+        settings = {"on": False, "hours": ""}
+        META["alarm"] = settings
+    return settings
+
+
+def parse_hours(text):
+    """'23-9' -> (23, 9). 'all' or '' -> None. Raises ValueError for anything else."""
+    text = str(text or "").strip().lower()
+    if text in ("", "all", "always"):
+        return None
+    start, end = (int(x) for x in text.replace(" ", "").split("-"))
+    if not (0 <= start <= 23 and 0 <= end <= 24) or start == end:
+        raise ValueError(text)
+    return start, end
+
+
+def in_alarm_hours(now=None):
+    window = parse_hours(alarm_settings().get("hours") or "")
+    if window is None:
+        return True
+    start, end = window
+    hour = local_time(time.time() if now is None else now).hour
+    return (start <= hour < end) if start < end else (hour >= start or hour < end)
+
+
+def alarm_should_ring():
+    settings = alarm_settings()
+    if not settings.get("on") or not in_alarm_hours() or ALARM["running"]:
+        return False
+    now = time.time()
+    ALARM["starts"] = [t for t in ALARM["starts"] if now - t < 3600]
+    return len(ALARM["starts"]) < ALARM_MAX_PER_HOUR
+
+
+def pushover_alarm(title, message, url):
+    """Sends a Pushover emergency alert (repeats every 60 s until acknowledged). Returns its receipt."""
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER):
+        return ""
+    data = urllib.parse.urlencode({
+        "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "title": title[:250], "message": message[:1000],
+        "priority": 2, "retry": 60, "expire": 900, "sound": "siren", "url": url, "url_title": "Buy now",
+    }).encode("utf-8")
+    request = urllib.request.Request(f"{PUSHOVER_BASE}/messages.json", data=data, method="POST")
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return str(json.loads(response.read().decode("utf-8")).get("receipt") or "")
+
+
+def pushover_cancel(receipt):
+    if not (receipt and PUSHOVER_TOKEN):
+        return
+    data = urllib.parse.urlencode({"token": PUSHOVER_TOKEN}).encode("utf-8")
+    request = urllib.request.Request(f"{PUSHOVER_BASE}/receipts/{urllib.parse.quote(receipt)}/cancel.json",
+                                     data=data, method="POST")
+    with urllib.request.urlopen(request, timeout=15) as response:
+        response.read()
+
+
+def callmebot_call(text):
+    """A Telegram voice call that reads the text twice. Needs CallMeBot authorised once."""
+    if not CALLMEBOT_USER:
+        return
+    query = urllib.parse.urlencode({"user": CALLMEBOT_USER, "text": text[:250], "lang": "en-GB-Standard-B", "rpt": 2})
+    with urllib.request.urlopen(f"{CALLMEBOT_BASE}/start.php?{query}", timeout=20) as response:
+        response.read()
+
+
+def alarm_headline(items):
+    names = []
+    for it in group_by_deck(items)[:2]:
+        shapes = " ".join(x["shape"] for x in it)
+        names.append(f"{shapes} {it[0]['product']}")
+    return " and ".join(names)
+
+
+def alarm_gone(ids):
+    """True once none of these sizes is in stock any more."""
+    with DATA_LOCK:
+        snapshot = dict(CURRENT_SNAPSHOT)
+    return not any(snapshot.get(i, {}).get("available") for i in ids)
+
+
+def ack_alarm():
+    ALARM["acked"] = True
+    return "Alarm off ✓"
+
+
+def alarm_run(items, test=False):
+    """Runs one alarm: outside layers once, then Telegram wake-up messages until you tap 'I'm up',
+    the stock is gone, or the rounds run out."""
+    ids = [it["id"] for it in items]
+    headline = "TEST · this is only a test" if test else alarm_headline(items)
+    buy = SITE if test else items[0]["cart_url"]
+    rounds = 2 if test else ALARM_MAX_ROUNDS
+    ALARM.update(acked=False, running=True, receipt="")
+    try:
+        try:
+            ALARM["receipt"] = pushover_alarm("Knife Mfg Co: IN STOCK" if not test else "Knife Mfg Co: test alarm",
+                                              headline, buy)
+        except Exception as e:
+            log(f"Pushover alarm failed: {e}")
+        try:
+            callmebot_call("Knife M F G drop! " + headline if not test else "This is a test of your drop alarm.")
+        except Exception as e:
+            log(f"CallMeBot call failed: {e}")
+
+        outcome = "rounds"
+        for number in range(1, rounds + 1):
+            markup = {"inline_keyboard": [
+                [{"text": btn("⚡ Buy now"), "url": buy}],
+                [{"text": btn("✅ I'm up"), "callback_data": "al:ack"}],
+            ]}
+            send_text(f"🚨 <h>WAKE UP</h>\n{LINE}\n{esc(headline)}\n"
+                      + ("This is only a test." if test else "In stock right now.") + f" ({number}/{rounds})", markup)
+            for _ in range(ALARM_REPEAT_SECONDS):
+                if ALARM["acked"]:
+                    outcome = "acked"
+                    break
+                if not test and alarm_gone(ids):
+                    outcome = "gone"
+                    break
+                time.sleep(1)
+            if outcome != "rounds":
+                break
+        try:
+            pushover_cancel(ALARM["receipt"])
+        except Exception as e:
+            log(f"Pushover cancel failed: {e}")
+        if outcome == "acked":
+            send_text("✅ <h>Alarm off</h>\n" + LINE + "\nGood luck!")
+        elif outcome == "gone":
+            send_text("🏁 <h>Gone</h>\n" + LINE + "\nIt sold out while the alarm was ringing. Check /history for how fast.")
+        else:
+            send_text("⏹ <h>Alarm stopped</h>\n" + LINE + f"\nNo answer after {rounds} rounds. /alarm off turns it off.")
+    finally:
+        ALARM["running"] = False
+
+
+def ring_alarm(items, test=False):
+    """Called right after a drop alert was delivered. Does nothing unless /alarm on and inside the hours."""
+    if not test:
+        if not alarm_should_ring():
+            return
+        ALARM["starts"].append(time.time())
+    if ALARM_ASYNC:
+        threading.Thread(target=alarm_run, args=(items, test), daemon=True).start()
+    else:
+        alarm_run(items, test)
+
+
+def alarm_status_text():
+    settings = alarm_settings()
+    hours = settings.get("hours") or ""
+    lines = [
+        "🚨 <h>Alarm</h>", LINE,
+        "It is <b>" + ("on" if settings.get("on") else "off") + "</b>"
+        + (f", only between {esc(hours.replace('-', ':00 and '))}:00 your time" if hours else ", at any hour") + ".",
+        "",
+        "<b>How it wakes you</b>",
+        "✅ Telegram wake-up messages, repeated until you tap I'm up",
+        ("✅" if PUSHOVER_TOKEN and PUSHOVER_USER else "⬜") + " Pushover emergency alert (breaks through Silent)",
+        ("✅" if CALLMEBOT_USER else "⬜") + " Telegram voice call (CallMeBot)",
+        LINE,
+        "<b>/alarm on</b> or <b>/alarm off</b>",
+        "<b>/alarm hours 23-9</b> only between 23:00 and 09:00, or <b>/alarm hours all</b>",
+        "<b>/alarm test</b> rings a test alarm now",
+    ]
+    return "\n".join(lines)
+
+
+def handle_alarm(argument):
+    parts = argument.strip().lower().split()
+    settings = alarm_settings()
+    if not parts:
+        send_text(alarm_status_text())
+        return
+    if parts[0] in ("on", "off"):
+        settings["on"] = parts[0] == "on"
+        save_meta()
+        send_text(alarm_status_text())
+    elif parts[0] == "hours" and len(parts) >= 2:
+        try:
+            parse_hours(parts[1])
+        except Exception:
+            send_text("🤔 Try <b>/alarm hours 23-9</b> (24-hour clock) or <b>/alarm hours all</b>.")
+            return
+        settings["hours"] = "" if parts[1] in ("all", "always") else parts[1]
+        save_meta()
+        send_text(alarm_status_text())
+    elif parts[0] == "test":
+        ring_alarm([{"id": "test", "product": "Test Deck", "shape": "KH1", "handle": "test", "cart_url": SITE}], test=True)
+    else:
+        send_text("🤔 Try <b>/alarm</b>, <b>/alarm on</b>, <b>/alarm off</b>, <b>/alarm hours 23-9</b> or <b>/alarm test</b>.")
+
+
+# ============================================================
 # MY PICKUPS
 # The bot can't see your payment (it happens in the shop's own checkout),
 # so a pickup is counted when YOU tap "I bought it" or send /bought.
@@ -2832,6 +3052,7 @@ def help_text():
         "/status — stock right now\n"
         "/radar — live radar page\n"
         "/ready — drop-day checklist\n"
+        "/alarm — wake me up when a drop lands\n"
         "/watch NAME — alerts for a deck by name\n"
         "/unwatch NAME — stop watching\n"
         "/drop — fast checking (/drop 45, /drop 20:00)\n"
@@ -2992,6 +3213,8 @@ def check_stock():
             remember_drop([it for it in wanted if it["id"] in delivered])
             record_restock([it for it in wanted if it["id"] in delivered])
             start_drop(DROP_IDLE_MINUTES, sticky=True)     # more usually follows a restock
+            if not fresh_memory:
+                ring_alarm([it for it in wanted if it["id"] in delivered])
         missed = len(pending - delivered)
         if missed:
             log(f"{missed} alert(s) could not be delivered. Retrying on the next check.")
@@ -3293,6 +3516,8 @@ def handle_command(command):
         handle_radar()
     elif command == "/ready":
         send_text(ready_text(), ready_markup())
+    elif command == "/alarm":
+        handle_alarm("")
     elif command == "/history":
         send_text(history_text())
     elif command == "/parcels":
@@ -3318,6 +3543,8 @@ def handle_callback(query):
         toast = handle_bought_tap(data)
     elif data.startswith("rd:"):
         toast = handle_ready_tap(query, data)
+    elif data == "al:ack":
+        toast = ack_alarm()
     elif data == "undo:yes":
         handle_undo(True)
         toast = "Removed ✓"
@@ -3378,6 +3605,10 @@ def telegram_listener(offset):
                     continue
                 command = text.split()[0].lower().split("@")[0]
                 log(f"Command received: {command}")
+                if command == "/alarm":
+                    parts = text.split(None, 1)
+                    handle_alarm(parts[1] if len(parts) > 1 else "")
+                    continue
                 if command == "/watch":
                     parts = text.split(None, 1)
                     handle_watch(parts[1] if len(parts) > 1 else "")
@@ -3421,6 +3652,7 @@ def telegram_listener(offset):
 # Every command, in the order of the Menu button in Telegram.
 MENU_COMMANDS = [
     ("status", "Stock right now"),
+    ("alarm", "Wake me up when a drop lands"),
     ("ready", "Drop-day checklist"),
     ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
