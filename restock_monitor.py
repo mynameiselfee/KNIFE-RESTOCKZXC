@@ -56,7 +56,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.9 (12 Oct 2026)"
+VERSION = "5.0 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -193,7 +193,7 @@ STATE = {}               # variant_id -> was in stock when last alerted/seen
 CURRENT_SNAPSHOT = {}    # variant_id -> item dict
 DATA_LOCK = threading.Lock()
 LAST_CHECK = 0.0         # when the shop was last read successfully
-META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "ready": {}, "alarm": {"on": False, "hours": ""}}
+META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "alarm": {"on": False, "hours": ""}, "auto_drop": True}
 
 
 def _write_json(path, data):
@@ -396,6 +396,39 @@ def touch_activity():
 
 
 _FAST = {"was": False}
+
+
+AUTO_DROP_MAX_MINUTES = max(10.0, float(os.getenv("AUTO_DROP_MAX_MINUTES", "120")))
+AUTO = {"since": 0.0}
+
+
+def auto_drop_on():
+    return bool(META.get("auto_drop", True))
+
+
+def auto_start_drop():
+    """Drop mode switched on by the radar itself (a restock, the shop opening). Respects the Auto drop switch."""
+    if auto_drop_on():
+        start_drop(DROP_IDLE_MINUTES, sticky=True)
+
+
+def auto_drop_when_in_stock(snapshot):
+    """While anything is in stock, keep checking fast. If it is still there after AUTO_DROP_MAX_MINUTES
+    (a size that is simply always available) it relaxes again, so it never stays fast for days."""
+    if not any(it["available"] for it in snapshot.values()):
+        AUTO["since"] = 0.0
+        return
+    if not auto_drop_on():
+        return
+    now = time.time()
+    if not AUTO["since"]:
+        AUTO["since"] = now
+    if now - AUTO["since"] > AUTO_DROP_MAX_MINUTES * 60:
+        return
+    if fast_now():
+        touch_activity()
+    else:
+        start_drop(DROP_IDLE_MINUTES, sticky=True)
 
 
 def span_text(minutes):
@@ -2353,6 +2386,8 @@ def panel_text():
         (f"⚡ Drop mode on · every {current_interval():g}s" if fast else f"🐢 Calm · every {current_interval():g}s"),
         alarm_summary(),
         ("🔮 Smart drop on" if smart_on() else "🔮 Smart drop off"),
+        ("⚡ Auto drop on: fast checking whenever something is in stock" if auto_drop_on()
+         else "⚡ Auto drop off"),
     ])
 
 
@@ -2367,7 +2402,7 @@ def panel_markup():
          {"text": state("🚨 Alarm", alarm_settings().get("on")), "callback_data": "pn:alarm"}],
         [{"text": state("🔮 Smart drop", smart_on()), "callback_data": "pn:smart"},
          {"text": btn("⚙ Alarm settings"), "callback_data": "pn:alarmset"}],
-        [{"text": btn("✅ Ready check"), "callback_data": "pn:ready"},
+        [{"text": state("⚡ Auto drop", auto_drop_on()), "callback_data": "pn:auto"},
          {"text": btn("👀 Watching"), "callback_data": "pn:watch"}],
         [{"text": btn("🏆 Pickups"), "callback_data": "pn:stats"},
          {"text": btn("📦 Parcels"), "callback_data": "pn:parcels"}],
@@ -2400,6 +2435,10 @@ def handle_panel_tap(query, data):
         META["smart"] = not smart_on()
         save_meta()
         toast = "Smart drop on" if META["smart"] else "Smart drop off"
+    elif key == "auto":
+        META["auto_drop"] = not auto_drop_on()
+        save_meta()
+        toast = "Auto drop on" if META["auto_drop"] else "Auto drop off"
     elif key == "alarmset":
         edit_message(query, alarm_text(), alarm_markup())
         return "Alarm settings"
@@ -2412,9 +2451,6 @@ def handle_panel_tap(query, data):
     elif key == "radar":
         handle_radar()
         return "Live radar ⬇"
-    elif key == "ready":
-        send_text(ready_text(), ready_markup())
-        return "Ready check ⬇"
     elif key == "watch":
         handle_watch("")
         return "Watching ⬇"
@@ -3209,10 +3245,10 @@ def help_text():
         "Tap /panel for buttons. Every command also works typed.\n"
         "\n"
         "<h>Stock</h>\n"
-        "/status · /panel · /radar · /ready\n"
+        "/status · /panel · /radar\n"
         "\n"
         "<h>Speed</h>\n"
-        "/drop (/drop 45, /drop 20:00) · /calm\n"
+        "/drop (/drop 45, /drop 20:00) · /calm · /autodrop\n"
         "/smart · /forecast · /history\n"
         "\n"
         "<h>Alerts</h>\n"
@@ -3327,10 +3363,11 @@ def check_stock():
         touch_activity()                               # stock moved: keep drop mode going
 
     available = sum(1 for it in snapshot.values() if it["available"])
+    auto_drop_when_in_stock(snapshot)
 
     if reopened:
         SHOP_LOCKED = False
-        start_drop(DROP_IDLE_MINUTES, sticky=True)
+        auto_start_drop()
         button = {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]}
         if PW["using"]:
             log("Inside the shop with your password")
@@ -3362,7 +3399,7 @@ def check_stock():
         if delivered:
             remember_drop([it for it in wanted if it["id"] in delivered])
             record_restock([it for it in wanted if it["id"] in delivered])
-            start_drop(DROP_IDLE_MINUTES, sticky=True)     # more usually follows a restock
+            auto_start_drop()                              # more usually follows a restock
             if not fresh_memory:
                 ring_alarm([it for it in wanted if it["id"] in delivered])
         missed = len(pending - delivered)
@@ -3544,109 +3581,21 @@ def handle_unwatch(argument):
     send_text(f"👀 Stopped watching <b>{esc(found)}</b>.")
 
 
-# ============================================================
-# /ready: a drop-day checklist you can tap through
-# ============================================================
-
-READY_STEPS = [
-    ("password", "Shop password pasted in Safari", "Password"),
-    ("payment", "Payment ready at the shop", "Payment"),
-    ("alerts", "Telegram alerts switched on", "Alerts"),
-]
-CHECKOUT_REQUIRED = ["CHECKOUT_EMAIL", "CHECKOUT_FIRST_NAME", "CHECKOUT_LAST_NAME", "CHECKOUT_ADDRESS",
-                     "CHECKOUT_CITY", "CHECKOUT_ZIP", "CHECKOUT_COUNTRY"]
-
-
-def ready_state():
-    """What you have ticked. It clears itself after 12 hours, so each drop starts fresh."""
-    state = META.get("ready") or {}
-    if time.time() - float(state.get("t") or 0) > 12 * 3600:
-        state = {"t": time.time()}
-        META["ready"] = state
-    return state
-
-
-def ready_auto():
-    """The checks the bot can do by itself: (done, text)."""
-    checks = []
-    missing = [n[9:].lower() for n in CHECKOUT_REQUIRED if not os.getenv(n, "").strip()]
-    checks.append((not missing, "Checkout details filled in" if not missing
-                   else "Checkout details missing: " + ", ".join(missing)))
-    checks.append((fast_now(), "Drop mode on" if fast_now() else "Drop mode off (tap below)"))
-    fresh = LAST_CHECK and time.time() - LAST_CHECK < max(60, 4 * current_interval())
-    if HEALTH["error"]:
-        checks.append((False, "Shop check problem: " + HEALTH["error"]))
-    elif SHOP_LOCKED:
-        checks.append((True, "Shop is locked: I'm waiting for it to open"))
-    else:
-        checks.append((bool(fresh), "I'm checking the shop" if fresh else "No recent check yet"))
-    best = drill_stats()["best"]
-    checks.append((bool(best), f"Practiced a drill (best {best / 1000:.1f} s)" if best else "No practice drill yet (/radar)"))
-    checks.append((MEMORY_OK, "Memory saved" if MEMORY_OK else "Memory not saved: add a Volume at /data"))
-    return checks
-
-
-def ready_text():
-    state = ready_state()
-    lines = ["✅ <h>Ready check</h>", LINE, "<b>I checked</b>"]
-    todo = 0
-    for ok, text in ready_auto():
-        lines.append(("✅ " if ok else "⬜ ") + esc(text))
-        todo += 0 if ok else 1
-    lines.append("<b>You tick</b>")
-    for key, text, _short in READY_STEPS:
-        ok = bool(state.get(key))
-        lines.append(("✅ " if ok else "⬜ ") + esc(text))
-        todo += 0 if ok else 1
-    lines.append(LINE)
-    lines.append("🟢 <b>You're ready.</b> Good luck!" if todo == 0 else f"⚠️ {todo} to go")
-    return "\n".join(lines)
-
-
-def ready_markup():
-    state = ready_state()
-    tick = [{"text": btn(("✅ " if state.get(k) else "⬜ ") + short), "callback_data": f"rd:{k}"}
-            for k, _text, short in READY_STEPS]
-    rows = [tick[:2], tick[2:]]
-    action = []
-    if not fast_now():
-        action.append({"text": btn("⚡ Drop mode on"), "callback_data": "rd:drop"})
-    action.append({"text": btn("🛒 Open shop"), "url": SITE})
-    rows.append(action)
-    radar = radar_markup()
-    if radar:
-        rows.append(radar["inline_keyboard"][0])
-    rows.append([{"text": btn("↺ Start over"), "callback_data": "rd:reset"}])
-    return {"inline_keyboard": rows}
-
-
-def handle_ready_tap(query, data):
-    """A tick, drop mode or reset from the checklist. Redraws the message. Returns the pop-up text."""
-    key = data[3:]
-    state = ready_state()
-    if key == "drop":
-        start_drop(DROP_MANUAL_MINUTES, sticky=True)
-        toast = "Drop mode on ⚡"
-    elif key == "reset":
-        META["ready"] = {"t": time.time()}
-        toast = "Cleared"
-    elif key in [k for k, _t, _s in READY_STEPS]:
-        state[key] = not state.get(key)
-        state["t"] = state.get("t") or time.time()
-        META["ready"] = state
-        toast = "Ticked ✓" if state[key] else "Unticked"
-    else:
-        return "✓"
-    save_meta()
-    telegram_api("editMessageText", {
-        "chat_id": str(query.get("message", {}).get("chat", {}).get("id", "")),
-        "message_id": query["message"]["message_id"],
-        "text": render(ready_text()),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-        "reply_markup": json.dumps(ready_markup()),
-    })
-    return toast
+def handle_autodrop(argument):
+    """/autodrop shows it. /autodrop on or /autodrop off changes it."""
+    arg = argument.strip().lower()
+    if arg in ("on", "off"):
+        META["auto_drop"] = arg == "on"
+        save_meta()
+    elif arg:
+        send_text("🤔 Try <b>/autodrop on</b> or <b>/autodrop off</b>, or use the button in /panel.")
+        return
+    state = "on" if auto_drop_on() else "off"
+    send_text(
+        f"⚡ <h>Auto drop</h>\n{LINE}\nIt is <b>{state}</b>.\n"
+        "When something is in stock, I switch to fast checking by myself and stay fast while it lasts.\n"
+        "<b>/autodrop on</b> or <b>/autodrop off</b>."
+    )
 
 
 def handle_command(command):
@@ -3666,8 +3615,6 @@ def handle_command(command):
         send_text(forecast_text())
     elif command == "/radar":
         handle_radar()
-    elif command == "/ready":
-        send_text(ready_text(), ready_markup())
     elif command == "/alarm":
         handle_alarm("")
     elif command == "/panel":
@@ -3695,8 +3642,6 @@ def handle_callback(query):
         toast = f"{data[3:]} is sold out right now."
     elif data.startswith(("b:", "c:")):
         toast = handle_bought_tap(data)
-    elif data.startswith("rd:"):
-        toast = handle_ready_tap(query, data)
     elif data == "al:ack":
         toast = ack_alarm()
     elif data.startswith("al:"):
@@ -3763,6 +3708,10 @@ def telegram_listener(offset):
                     continue
                 command = text.split()[0].lower().split("@")[0]
                 log(f"Command received: {command}")
+                if command == "/autodrop":
+                    parts = text.split(None, 1)
+                    handle_autodrop(parts[1] if len(parts) > 1 else "")
+                    continue
                 if command == "/alarm":
                     parts = text.split(None, 1)
                     handle_alarm(parts[1] if len(parts) > 1 else "")
@@ -3812,9 +3761,9 @@ MENU_COMMANDS = [
     ("panel", "Control panel with buttons"),
     ("status", "Stock right now"),
     ("alarm", "Wake me up when a drop lands"),
-    ("ready", "Drop-day checklist"),
     ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
+    ("autodrop", "Auto drop mode on or off"),
     ("calm", "Back to calm checking"),
     ("watch", "Alerts for a deck by name"),
     ("unwatch", "Stop watching a name"),
