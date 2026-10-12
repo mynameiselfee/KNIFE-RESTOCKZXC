@@ -6,7 +6,8 @@ Railway variables
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    required
   CHECK_INTERVAL        seconds between checks in calm mode (default 12, minimum 2)
   DROP_INTERVAL         seconds between checks in drop mode (default 4, minimum 2)
-  DROP_IDLE_MINUTES     drop mode goes back to calm after this long with no activity (default 60)
+  DROP_MANUAL_MINUTES   how long /drop keeps drop mode on (default 180 = 3 hours)
+  DROP_IDLE_MINUTES     automatic drop mode (restock, shop opens) goes back to calm after this long quiet (default 60)
   LOG_EVERY             1 = log every check (default 60, about every 5 min)
   STARTUP_PING          0 turns off the "radar online" message
   ALERT_ON_START        0 = stay silent about decks already in stock at start-up
@@ -24,6 +25,7 @@ Railway variables
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
   PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
   LIVE_RADAR            0 turns the live radar page off
+  RADAR_THEME           auto (follows Telegram, default), dark or light
   SHOP_URL              only for testing against a fake shop
 """
 import gzip
@@ -53,12 +55,13 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "4.0 (11 Oct 2026)"
+VERSION = "4.3 (11 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "12")))   # calm mode: easy on the shop
 DROP_INTERVAL = max(2.0, float(os.getenv("DROP_INTERVAL", "4")))      # drop mode: fast
 DROP_IDLE_MINUTES = max(5.0, float(os.getenv("DROP_IDLE_MINUTES", "60")))   # quiet this long = back to calm
+DROP_MANUAL_MINUTES = max(5.0, float(os.getenv("DROP_MANUAL_MINUTES", "180")))   # what /drop gives you
 LOG_EVERY = max(1, int(os.getenv("LOG_EVERY", "60")))
 STARTUP_PING = os.getenv("STARTUP_PING", "1") == "1"
 ALERT_ON_START = os.getenv("ALERT_ON_START", "1") == "1"
@@ -332,7 +335,7 @@ PACE = {"extra": 0.0, "last_limit": 0.0, "buster": os.getenv("CACHE_BUSTER", "1"
 HEALTH = {"error": ""}      # why the last check failed ("" = all good)
 
 
-DROP = {"from": 0.0, "until": 0.0, "sticky": False}     # drop mode window (unix seconds)
+DROP = {"from": 0.0, "until": 0.0, "sticky": False, "span": 0.0}     # drop mode window (unix seconds)
 
 
 def fast_now():
@@ -355,14 +358,16 @@ def clock(ts):
 def start_drop(minutes, begin=None, sticky=False):
     """Fast checking from `begin` (default now) for `minutes`. Only ever extends a running window.
     A sticky window (from /drop, a restock or the shop opening) stays on while things keep happening
-    and ends after DROP_IDLE_MINUTES of quiet."""
+    and ends once it has been quiet for its whole length."""
     now = time.time()
     begin = now if begin is None else begin
     end = begin + minutes * 60
+    span = minutes
     if fast_now() and begin <= now:
         end = max(end, DROP["until"])
         sticky = sticky or DROP.get("sticky", False)
-    DROP["from"], DROP["until"], DROP["sticky"] = begin, end, sticky
+        span = max(float(DROP.get("span") or 0), minutes)
+    DROP["from"], DROP["until"], DROP["sticky"], DROP["span"] = begin, end, sticky, span
     META["drop_from"], META["drop_until"], META["drop_sticky"] = begin, end, sticky
     save_meta()
 
@@ -380,6 +385,8 @@ def touch_activity():
     if not (DROP.get("sticky") and fast_now()):
         return
     now = time.time()
+    if now + DROP_IDLE_MINUTES * 60 > DROP["until"]:
+        DROP["span"] = DROP_IDLE_MINUTES                      # the quiet time that now counts
     DROP["until"] = max(DROP["until"], now + DROP_IDLE_MINUTES * 60)
     META["drop_until"] = DROP["until"]
     if now - DROP.get("saved_at", 0.0) > 60:
@@ -390,12 +397,19 @@ def touch_activity():
 _FAST = {"was": False}
 
 
+def span_text(minutes):
+    """180 -> '3 h', 60 -> '60 min'."""
+    if minutes >= 120 and minutes % 60 == 0:
+        return f"{int(minutes // 60)} h"
+    return f"{minutes:g} min"
+
+
 def check_drop_end():
     """Tells you once when drop mode ends by itself (it is not told when you switch it off)."""
     now_fast = fast_now()
     if _FAST["was"] and not now_fast and DROP["until"] > 0:
         if DROP.get("sticky"):
-            why = f"No activity for {DROP_IDLE_MINUTES:g} min."
+            why = f"No activity for {span_text(DROP.get('span') or DROP_IDLE_MINUTES)}."
         else:
             why = "The drop window is over."
         DROP["sticky"] = False
@@ -805,6 +819,10 @@ def alert_caption(group, test=False):
         lines.append(row)
     if one_price:
         lines.append(f"💵 {prices.pop()}")
+    if not test:
+        usual = [x for x in (typical_gone(it["shape"]) for it in group) if x]
+        if usual:
+            lines.append(f"⏱ usually gone in ~{human(min(usual))}")
 
     lines.append(LINE)
     if test:
@@ -966,6 +984,50 @@ def heat_label(fastest):
     if fastest < 1800:
         return f"🌤 WARM · first one gone in {human(fastest)}"
     return f"😴 CHILL · first one gone in {human(fastest)}"
+
+
+def median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+
+
+def typical_gone(shape=None):
+    """How long sizes usually last, in seconds (median of past drops). None until there are 2 samples."""
+    times = [e["gone"] for ev in META.get("events") or [] for e in ev["items"].values()
+             if e["gone"] is not None and (shape is None or e["shape"] == shape)]
+    return median(times) if len(times) >= 2 else None
+
+
+def live_since(vid):
+    """Seconds this size has been live, if it came from a drop I alerted you about and is still there."""
+    for event in reversed(META.get("events") or []):
+        entry = event["items"].get(vid)
+        if entry is not None:
+            return (time.time() - event["t"]) if entry["gone"] is None else None
+    return None
+
+
+DRILL_DEFAULT_LIMIT = 45.0
+
+
+def drill_stats():
+    runs = META.get("drills") or []
+    wins = [r["ms"] for r in runs if r.get("won")]
+    return {
+        "count": len(runs),
+        "wins": len(wins),
+        "best": min(wins) if wins else None,
+        "avg": round(sum(wins) / len(wins)) if wins else None,
+        "shape": SHAPES[0],
+        "limit": typical_gone(SHAPES[0]) or typical_gone() or DRILL_DEFAULT_LIMIT,
+    }
+
+
+def record_drill(ms, won):
+    META.setdefault("drills", []).append({"t": time.time(), "ms": int(ms), "won": bool(won)})
+    del META["drills"][:-100]
+    save_meta()
 
 
 def local_time(ts):
@@ -1140,6 +1202,7 @@ def handle_smart(argument):
 # ============================================================
 
 LIVE_RADAR = os.getenv("LIVE_RADAR", "1") == "1"
+RADAR_THEME = os.getenv("RADAR_THEME", "auto").strip().lower()
 
 
 def public_url():
@@ -1189,8 +1252,10 @@ def dashboard_state():
         tiles.append({
             "shape": shape,
             "count": len(live),
+            "typical": typical_gone(shape),
             "live": [{"product": it["product"], "size": it["size"], "sgd": money(it["price"]),
-                      "buy": it["cart_url"], "page": it["product_url"], "image": it["image"]}
+                      "buy": it["cart_url"], "page": it["product_url"], "image": it["image"],
+                      "since": live_since(it["id"])}
                      for it in live[:6]],
         })
     last_event = None
@@ -1213,145 +1278,199 @@ def dashboard_state():
         "locked": bool(SHOP_LOCKED),
         "problem": HEALTH["error"],
         "mode": {"fast": fast_now(), "sticky": bool(DROP.get("sticky")), "until": DROP["until"],
-                 "interval": current_interval(), "idle": DROP_IDLE_MINUTES},
+                 "interval": current_interval(), "idle": DROP_IDLE_MINUTES,
+                 "span": float(DROP.get("span") or DROP_IDLE_MINUTES)},
         "tiles": tiles,
         "last_event": last_event,
         "pickups": len(META.get("purchases") or []),
         "parcels": [{"label": p["label"], "status": status_label(p.get("status")), "event": p.get("event") or ""}
                     for p in META.get("parcels") or [] if not p.get("delivered")],
         "next_drop": next_drop,
+        "drill": drill_stats(),
     }
 
 
 DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="theme-color" content="#0b1126">
-<title>KNIFE MFG CO radar</title>
+<title>KNIFE MFG CO</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:#0b1126;--panel:#131b3a;--line:#2a3a78;--cyan:#4fd8ff;--yellow:#ffd23f;--green:#35f28a;--red:#ff5d73;--dim:#6b779e;--text:#e8edff}
+:root{
+  --bg:#0b0c0f;--surface:#14161b;--surface2:#1b1e25;--line:rgba(255,255,255,.09);
+  --text:#f3f5f9;--dim:#8d95a6;--accent:#3ee6a8;--on-accent:#06130d;
+  --accent-soft:rgba(62,230,168,.10);--accent-line:rgba(62,230,168,.42);
+  --amber:#ffb454;--danger:#ff6b7a;--overlay:rgba(8,9,12,.82);--shadow:0 1px 0 rgba(255,255,255,.04) inset;
+}
+:root[data-resolved="light"]{
+  --bg:#f4f5f8;--surface:#ffffff;--surface2:#eef0f4;--line:rgba(14,18,30,.10);
+  --text:#12141a;--dim:#677086;--accent:#0fae78;--on-accent:#ffffff;
+  --accent-soft:rgba(15,174,120,.08);--accent-line:rgba(15,174,120,.40);
+  --amber:#c9741c;--danger:#d63c4f;--overlay:rgba(244,245,248,.86);--shadow:0 1px 2px rgba(14,18,30,.05);
+}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;background:var(--bg);color:var(--text);font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;-webkit-text-size-adjust:100%}
-body{padding:max(14px,env(safe-area-inset-top)) 14px max(24px,env(safe-area-inset-bottom));min-height:100vh;overflow-x:hidden}
-header{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px}
-.brand{font-size:15px;font-weight:700;letter-spacing:2px;color:var(--yellow)}
-.brand small{display:block;font-size:10px;letter-spacing:1px;color:var(--dim);font-weight:400;margin-top:2px}
-.chip{font-size:11px;letter-spacing:1px;padding:6px 10px;border:2px solid var(--line);background:var(--panel);white-space:nowrap}
-.chip.fast{border-color:var(--yellow);color:var(--yellow)}
-.chip.calm{border-color:var(--cyan);color:var(--cyan)}
-.chip.warn{border-color:var(--red);color:var(--red)}
-.chip.lock{border-color:var(--red);color:var(--red)}
-.card{border:2px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px;position:relative}
-.card h2{margin:0 0 8px;font-size:11px;letter-spacing:2px;color:var(--dim);font-weight:400}
-#radarWrap{display:flex;justify-content:center;padding:6px 0 2px}
-#radar{position:relative;width:216px;height:216px;border-radius:50%;border:2px solid var(--line);
- background:radial-gradient(circle,transparent 0 24%,rgba(79,216,255,.18) 24.5% 25.5%,transparent 26% 49%,rgba(79,216,255,.18) 49.5% 50.5%,transparent 51% 74%,rgba(79,216,255,.18) 74.5% 75.5%,transparent 76%),var(--bg);overflow:hidden}
-#radar::before{content:"";position:absolute;left:0;top:0;right:0;bottom:0;border-radius:50%;
- background:conic-gradient(from 0deg,rgba(53,242,138,0) 0deg,rgba(53,242,138,.35) 55deg,rgba(53,242,138,0) 56deg);animation:sweep 3.2s linear infinite}
-#radar.fast::before{animation-duration:1.1s;background:conic-gradient(from 0deg,rgba(255,210,63,0) 0deg,rgba(255,210,63,.4) 55deg,rgba(255,210,63,0) 56deg)}
-@keyframes sweep{to{transform:rotate(360deg)}}
-#radar::after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(79,216,255,.15);box-shadow:-108px 108px 0 0 transparent}
-.blip{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;border:2px solid var(--line);background:var(--bg);color:var(--dim);z-index:2}
-.blip.live{border-color:var(--green);color:var(--green);animation:ping 1.2s ease-out infinite}
-@keyframes ping{0%{box-shadow:0 0 0 0 rgba(53,242,138,.7)}100%{box-shadow:0 0 0 18px rgba(53,242,138,0)}}
-#core{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;z-index:3}
-#coreNum{font-size:34px;font-weight:700;color:var(--green);line-height:1}
-#coreLbl{font-size:10px;letter-spacing:2px;color:var(--dim);margin-top:4px}
-.shape{border:2px solid var(--line);background:var(--panel);margin-bottom:10px;padding:10px 12px}
-.shape.live{border-color:var(--green);animation:glow 1.6s ease-in-out infinite}
-@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(53,242,138,.0)}50%{box-shadow:0 0 14px 2px rgba(53,242,138,.45)}}
-.shape .top{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:700;letter-spacing:1px}
+html,body{margin:0;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",system-ui,sans-serif;
+  -webkit-text-size-adjust:100%;font-variant-numeric:tabular-nums}
+body{padding:max(16px,env(safe-area-inset-top)) 16px max(28px,env(safe-area-inset-bottom));min-height:100vh;overflow-x:hidden}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:2px 2px 16px}
+.brand b{display:block;font-size:15px;font-weight:650;letter-spacing:.14em}
+.brand span{display:block;font-size:12px;color:var(--dim);margin-top:3px}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;background:var(--surface2);
+  border:1px solid var(--line);font-size:12px;font-weight:600;white-space:nowrap}
+.pill i{width:8px;height:8px;border-radius:50%;background:var(--dim);display:block}
+.pill.live i{background:var(--accent)}
+.pill.fast i{background:var(--amber);animation:beat 1.4s ease-in-out infinite}
+.pill.warn i,.pill.lock i{background:var(--danger)}
+@keyframes beat{50%{opacity:.35}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 12px;font-size:11px;font-weight:600;color:var(--dim);letter-spacing:.09em;text-transform:uppercase}
+
+.hero{text-align:center;padding:22px 16px 18px}
+#gauge{position:relative;width:224px;height:224px;margin:0 auto}
+#gauge svg{display:block;width:224px;height:224px;overflow:visible}
+.seg{fill:none;stroke:var(--line);stroke-width:14;stroke-linecap:round;transition:stroke .4s}
+.seg.live{stroke:var(--accent);animation:glow 2.6s ease-in-out infinite}
+.fast .seg.live{animation-duration:1.3s}
+@keyframes glow{50%{opacity:.55}}
+.segLbl{font-size:10px;font-weight:650;letter-spacing:.08em;fill:var(--dim);text-anchor:middle;dominant-baseline:central}
+.segLbl.live{fill:var(--accent)}
+.ringTrack{fill:none;stroke:var(--line);stroke-width:2}
+#progress{fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;transition:stroke-dashoffset .3s linear;opacity:.8}
+#core{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center}
+#coreNum{font-size:56px;font-weight:600;line-height:1;letter-spacing:-.02em;color:var(--dim)}
+#coreNum.on{color:var(--accent)}
+#coreLbl{font-size:12px;color:var(--dim);margin-top:8px}
+#summary{margin-top:16px;font-size:14px;color:var(--text)}
+#summary small{display:block;font-size:12px;color:var(--dim);margin-top:4px}
+
+.shape{background:var(--surface);border:1px solid var(--line);border-radius:18px;margin-bottom:10px;padding:14px 16px}
+.shape.live{border-color:var(--accent-line);background:linear-gradient(var(--accent-soft),var(--accent-soft)),var(--surface)}
 .shape.sold{opacity:.55}
-.shape.sold .top{font-weight:400}
-.tag{font-size:10px;letter-spacing:1px;padding:3px 7px;border:1px solid currentColor}
-.tag.live{color:var(--green)}.tag.sold{color:var(--dim)}
-.deck{display:flex;gap:10px;align-items:center;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
-.deck img{width:46px;height:46px;object-fit:contain;background:#fff;flex:none}
+.shape .top{display:flex;justify-content:space-between;align-items:center}
+.shape .nm{font-size:16px;font-weight:650;letter-spacing:.02em}
+.tag{font-size:11px;font-weight:600;color:var(--dim)}
+.tag.live{color:var(--accent)}
+.deck{display:flex;gap:12px;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.deck img{width:48px;height:48px;object-fit:contain;background:#fff;border-radius:10px;flex:none}
 .deck .meta{flex:1;min-width:0}
-.deck .name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.deck .sub{font-size:11px;color:var(--dim);margin-top:3px}
-.buy{flex:none;font-family:inherit;font-weight:700;font-size:13px;letter-spacing:1px;color:#10172e;background:var(--green);border:0;padding:12px 14px;min-height:44px;cursor:pointer;box-shadow:0 3px 0 #1c9b58}
-.buy:active{transform:translateY(2px);box-shadow:0 1px 0 #1c9b58}
-.modeRow{display:flex;gap:8px}
-.btn{flex:1;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:1px;color:var(--text);background:transparent;border:2px solid var(--line);padding:12px 6px;min-height:44px;cursor:pointer}
-.btn.on{border-color:var(--yellow);color:var(--yellow)}
-.btn.on.calmBtn{border-color:var(--cyan);color:var(--cyan)}
-.btn:active{transform:translateY(1px)}
-#modeNote{font-size:11px;color:var(--dim);margin-top:8px;line-height:1.5}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
-.stat{border:2px solid var(--line);background:var(--panel);padding:10px 6px;text-align:center}
-.stat b{display:block;font-size:20px;color:var(--yellow)}
-.stat span{display:block;font-size:10px;letter-spacing:1px;color:var(--dim);margin-top:4px}
-.bar{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:6px}
-.bar .k{width:96px;flex:none;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar .track{flex:1;height:10px;background:var(--bg);border:1px solid var(--line)}
-.bar .fill{height:100%;background:var(--green)}
+.deck .name{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deck .sub{font-size:12px;color:var(--dim);margin-top:3px}
+.buy{flex:none;font-family:inherit;font-weight:650;font-size:14px;color:var(--on-accent);background:var(--accent);border:0;
+  border-radius:999px;padding:0 20px;min-height:44px;cursor:pointer}
+.buy:active{transform:scale(.97)}
+.clock{margin-top:10px}
+.clock .txt{font-size:12px;color:var(--dim);margin-bottom:6px}
+.clock .track{height:4px;border-radius:4px;background:var(--surface2);overflow:hidden}
+.clock .fill{height:100%;border-radius:4px;background:var(--accent);transition:width .5s linear}
+.clock.late .fill{background:var(--danger)}
+.clock.late .txt{color:var(--danger)}
+
+.seg2{display:flex;background:var(--surface2);border-radius:14px;padding:4px;gap:4px}
+.btn{flex:1;font-family:inherit;font-size:14px;font-weight:600;color:var(--dim);background:transparent;border:0;border-radius:11px;min-height:44px;cursor:pointer}
+.btn.on{background:var(--surface);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.25)}
+.btn.on.drop{color:var(--amber)}
+.btn.on.calmBtn{color:var(--accent)}
+#modeNote{font-size:12px;color:var(--dim);margin-top:10px;line-height:1.5}
+
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 8px;text-align:center}
+.stat b{display:block;font-size:22px;font-weight:600}
+.stat span{display:block;font-size:11px;color:var(--dim);margin-top:5px}
+
+.bar{display:flex;align-items:center;gap:10px;font-size:12px;margin-top:10px}
+.bar .k{width:104px;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar .track{flex:1;height:4px;border-radius:4px;background:var(--surface2);overflow:hidden}
+.bar .fill{height:100%;border-radius:4px;background:var(--accent)}
 .bar .v{width:64px;flex:none;text-align:right;color:var(--dim)}
-.heat{margin-top:10px;font-size:12px;color:var(--yellow)}
-.parcel{font-size:12px;margin-top:6px;line-height:1.5}
+.heat{margin-top:14px;font-size:13px;color:var(--amber)}
+.parcel{font-size:13px;margin-top:10px;line-height:1.5}
 .parcel i{font-style:normal;color:var(--dim)}
-#ground{position:relative;height:34px;margin:6px -14px 0;border-top:2px solid var(--line);overflow:hidden}
-#board{position:absolute;left:-60px;bottom:6px;width:46px;height:14px;animation:roll 7s linear infinite}
-#board.fast{animation-duration:3s}
-#board .deck2{position:absolute;left:0;right:0;top:0;height:6px;background:var(--yellow);border-radius:3px;box-shadow:0 2px 0 #b58f00}
-#board .w{position:absolute;bottom:0;width:8px;height:8px;background:var(--red);border-radius:50%}
-#board .w.a{left:6px}#board .w.b{right:6px}
-@keyframes roll{0%{transform:translateX(0)}45%{transform:translateX(220px) rotate(0)}55%{transform:translateX(250px) translateY(-14px) rotate(360deg)}60%{transform:translateX(262px) rotate(360deg)}100%{transform:translateX(520px)}}
-footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;margin-top:10px}
-#locked{display:none;text-align:center;padding:60px 20px;color:var(--dim);line-height:1.7}
-#locked b{color:var(--yellow)}
-.pop{position:fixed;top:-30px;z-index:9;font-size:22px;animation:fall 2.4s ease-in forwards;pointer-events:none}
-@keyframes fall{to{transform:translateY(110vh) rotate(540deg);opacity:.9}}
-#flash{position:fixed;inset:0;background:rgba(53,242,138,.28);opacity:0;pointer-events:none;z-index:8}
-#flash.go{animation:flash .9s ease-out}
+#drillStats{font-size:13px;color:var(--dim);line-height:1.55;white-space:pre-line}
+.ghost{width:100%;margin-top:12px;font-family:inherit;font-size:14px;font-weight:600;color:var(--text);background:var(--surface2);border:0;border-radius:14px;min-height:46px;cursor:pointer}
+footer{text-align:center;font-size:11px;color:var(--dim);margin-top:14px}
+#locked{display:none;text-align:center;padding:90px 24px;color:var(--dim);line-height:1.7;font-size:14px}
+#locked b{color:var(--text);letter-spacing:.14em}
+
+#flash{position:fixed;left:0;top:0;right:0;bottom:0;background:radial-gradient(circle at 50% 40%,var(--accent-line),transparent 70%);opacity:0;pointer-events:none;z-index:8}
+#flash.go{animation:flash 1s ease-out}
 @keyframes flash{0%{opacity:1}100%{opacity:0}}
-@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+.ovl{position:fixed;left:0;top:0;right:0;bottom:0;z-index:20;background:var(--overlay);-webkit-backdrop-filter:blur(22px);backdrop-filter:blur(22px);
+  display:none;flex-direction:column;justify-content:center;gap:14px;padding:max(20px,env(safe-area-inset-top)) 20px max(20px,env(safe-area-inset-bottom));overflow-y:auto}
+.ovl.show{display:flex}
+.ovl .title{text-align:center;font-size:12px;font-weight:650;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+.ovl .dtext{text-align:center;white-space:pre-line;font-size:16px;line-height:1.6}
+.ovl .big{text-align:center;font-size:64px;font-weight:600;letter-spacing:-.02em;color:var(--accent)}
+.ovl .big.bad{color:var(--danger)}
+.ovl .clock .txt{text-align:center;font-size:14px}
+.ovl button{width:100%}
+.bigbtn{font-family:inherit;border:0;background:var(--accent);color:var(--on-accent);font-weight:650;font-size:22px;border-radius:24px;
+  padding:26px 16px;min-height:112px;white-space:pre-line;line-height:1.35}
+.bigbtn:active{transform:scale(.98)}
+.bigbtn small{display:block;font-size:13px;font-weight:500;margin-top:8px;opacity:.8}
+.bigbtn.dark{background:var(--text);color:var(--bg)}
+.xbtn{font-family:inherit;background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:16px;min-height:48px;font-size:14px;font-weight:600}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <div id="flash"></div>
-<div id="locked"><b>KNIFE MFG CO</b><br><br>Open this page from the bot in Telegram:<br>send <b>/radar</b> and tap <b>Open live radar</b>.</div>
+<div id="big" class="ovl"></div>
+<div id="drill" class="ovl"></div>
+<div id="locked"><b>KNIFE MFG CO</b><br><br>Open this page from the bot in Telegram:<br>send /radar and tap Open live radar.</div>
+
 <div id="app" style="display:none">
   <header>
-    <div class="brand">KNIFE MFG CO<small>DECK RADAR · LIVE</small></div>
-    <div id="chip" class="chip calm">CALM</div>
+    <div class="brand"><b>KNIFE MFG CO</b><span>Live stock</span></div>
+    <div id="chip" class="pill"><i></i><span>Calm</span></div>
   </header>
 
-  <div class="card">
-    <div id="radarWrap"><div id="radar"><div id="core"><div id="coreNum">0</div><div id="coreLbl">IN STOCK</div></div></div></div>
-    <div id="ground"><div id="board"><div class="deck2"></div><div class="w a"></div><div class="w b"></div></div></div>
-  </div>
+  <section class="card hero" id="hero">
+    <div id="gauge">
+      <svg id="gaugeSvg" viewBox="0 0 224 224" aria-hidden="true">
+        <circle class="ringTrack" cx="112" cy="112" r="108"></circle>
+        <circle id="progress" cx="112" cy="112" r="108" transform="rotate(-90 112 112)"></circle>
+      </svg>
+      <div id="core"><div id="coreNum">0</div><div id="coreLbl">in stock</div></div>
+    </div>
+    <div id="summary"></div>
+  </section>
 
   <div id="shapes"></div>
 
   <div class="card">
-    <h2>SPEED</h2>
-    <div class="modeRow">
-      <button id="dropBtn" class="btn">⚡ DROP MODE</button>
-      <button id="calmBtn" class="btn calmBtn">🐢 CALM</button>
+    <h2>Speed</h2>
+    <div class="seg2">
+      <button id="dropBtn" class="btn drop">Drop mode</button>
+      <button id="calmBtn" class="btn calmBtn">Calm</button>
     </div>
     <div id="modeNote"></div>
   </div>
 
   <div class="stats">
-    <div class="stat"><b id="sPick">0</b><span>PICKUPS</span></div>
-    <div class="stat"><b id="sParcel">0</b><span>PARCELS</span></div>
-    <div class="stat"><b id="sNext">--</b><span>NEXT DROP</span></div>
+    <div class="stat"><b id="sPick">0</b><span>Pickups</span></div>
+    <div class="stat"><b id="sParcel">0</b><span>Parcels</span></div>
+    <div class="stat"><b id="sNext">--</b><span>Next drop</span></div>
   </div>
 
   <div class="card" id="reportCard" style="display:none">
-    <h2>LAST DROP</h2>
-    <div id="reportName" style="font-size:13px"></div>
+    <h2>Last drop</h2>
+    <div id="reportName" style="font-size:14px;font-weight:600"></div>
     <div id="reportBars"></div>
     <div id="heat" class="heat"></div>
   </div>
 
   <div class="card" id="parcelCard" style="display:none">
-    <h2>PARCELS ON THEIR WAY</h2>
+    <h2>Parcels on their way</h2>
     <div id="parcelList"></div>
+  </div>
+
+  <div class="card" id="drillCard">
+    <h2>Practice drop</h2>
+    <div id="drillStats"></div>
+    <button id="drillBtn" class="ghost">Start a drill</button>
   </div>
 
   <footer id="foot">connecting…</footer>
@@ -1361,13 +1480,28 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
 (function () {
   "use strict";
   var tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) {
-    try { tg.ready(); tg.expand(); tg.setHeaderColor("#0b1126"); tg.setBackgroundColor("#0b1126"); } catch (e) {}
-  }
   var initData = tg && tg.initData ? tg.initData : "";
   var $ = function (id) { return document.getElementById(id); };
   var state = null, fetchedAt = 0, prevLive = null, okAt = 0;
-  var BLIPS = [[50, 12], [88, 50], [50, 88], [12, 50]];
+  var clocks = [], bigTimer = null, drillTimers = [];
+  var NS = "http://www.w3.org/2000/svg", RING = 2 * Math.PI * 108, built = 0;
+
+  // ---- theme: follows Telegram's light or dark unless the bot says otherwise ----
+  function applyTheme() {
+    var want = document.documentElement.getAttribute("data-theme");
+    var scheme = want === "light" || want === "dark" ? want
+      : (tg && tg.colorScheme) ? tg.colorScheme
+      : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    document.documentElement.setAttribute("data-resolved", scheme);
+    if (tg) {
+      var bg = scheme === "light" ? "#f4f5f8" : "#0b0c0f";
+      try { tg.setHeaderColor(bg); tg.setBackgroundColor(bg); } catch (e) {}
+    }
+  }
+  applyTheme();
+  if (tg) {
+    try { tg.ready(); tg.expand(); if (tg.onEvent) tg.onEvent("themeChanged", applyTheme); } catch (e) {}
+  }
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -1382,6 +1516,7 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
     if (sec < 86400) return Math.floor(sec / 3600) + "h " + ("0" + Math.floor((sec % 3600) / 60)).slice(-2) + "m";
     return Math.floor(sec / 86400) + "d " + Math.floor((sec % 86400) / 3600) + "h";
   }
+  function mins(m) { m = Math.round(m); return (m >= 120 && m % 60 === 0) ? (m / 60) + " h" : m + " min"; }
   function openUrl(url) {
     if (!/^https?:\/\//i.test(url)) return;
     if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank", "noopener");
@@ -1391,45 +1526,187 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
   }
   function celebrate() {
     var f = $("flash"); f.classList.remove("go"); void f.offsetWidth; f.classList.add("go");
-    var icons = ["🛹", "⚡", "🎉", "🔥", "✨"];
-    for (var i = 0; i < 22; i++) {
-      var p = el("div", "pop", icons[i % icons.length]);
-      p.style.left = Math.round(Math.random() * 92) + "vw";
-      p.style.animationDelay = (Math.random() * 0.6).toFixed(2) + "s";
-      document.body.appendChild(p);
-      (function (n) { setTimeout(function () { if (n.parentNode) n.parentNode.removeChild(n); }, 3400); })(p);
-    }
     haptic("success");
   }
 
-  function renderRadar(s) {
-    var r = $("radar");
-    r.className = s.mode.fast ? "fast" : "";
-    var old = r.querySelectorAll(".blip");
-    for (var i = 0; i < old.length; i++) r.removeChild(old[i]);
-    var total = 0;
-    s.tiles.forEach(function (t, idx) {
-      total += t.count;
-      var b = el("div", "blip" + (t.count ? " live" : ""), t.shape);
-      b.style.left = BLIPS[idx % 4][0] + "%";
-      b.style.top = BLIPS[idx % 4][1] + "%";
-      r.appendChild(b);
+  // ---- the ring: four segments (one per size) and a hairline that fills until the next check ----
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function polar(r, deg) { var a = deg * Math.PI / 180; return [112 + r * Math.sin(a), 112 - r * Math.cos(a)]; }
+  function arc(r, a0, a1) {
+    var p0 = polar(r, a0), p1 = polar(r, a1);
+    return "M" + p0[0].toFixed(2) + " " + p0[1].toFixed(2) + " A" + r + " " + r + " 0 0 1 " + p1[0].toFixed(2) + " " + p1[1].toFixed(2);
+  }
+  function buildGauge(names) {
+    var svg = $("gaugeSvg"), old = svg.querySelectorAll(".seg,.segLbl");
+    for (var i = 0; i < old.length; i++) svg.removeChild(old[i]);
+    var span = 360 / names.length;
+    names.forEach(function (n, idx) {
+      svg.appendChild(svgEl("path", { "class": "seg", d: arc(88, idx * span + 7, (idx + 1) * span - 7), "data-shape": n }));
+      var c = polar(64, idx * span + span / 2);
+      var t = svgEl("text", { "class": "segLbl", x: c[0].toFixed(1), y: c[1].toFixed(1), "data-shape": n });
+      t.textContent = n; svg.appendChild(t);
     });
-    $("coreNum").textContent = String(total);
-    $("coreNum").style.color = total ? "#35f28a" : "#6b779e";
-    $("coreLbl").textContent = s.locked ? "LOCKED" : (total ? "IN STOCK" : "SOLD OUT");
-    $("board").className = s.mode.fast ? "fast" : "";
+    var prog = $("progress");
+    prog.setAttribute("stroke-dasharray", RING.toFixed(2));
+    prog.setAttribute("stroke-dashoffset", RING.toFixed(2));
+    built = names.length;
+  }
+  function renderGauge(s) {
+    if (built !== s.tiles.length) buildGauge(s.tiles.map(function (t) { return t.shape; }));
+    var live = [], total = 0;
+    s.tiles.forEach(function (t) {
+      total += t.count;
+      if (t.count) live.push(t.shape);
+      var on = t.count > 0;
+      var seg = document.querySelector('.seg[data-shape="' + t.shape + '"]');
+      var lbl = document.querySelector('.segLbl[data-shape="' + t.shape + '"]');
+      if (seg) seg.setAttribute("class", "seg" + (on ? " live" : ""));
+      if (lbl) lbl.setAttribute("class", "segLbl" + (on ? " live" : ""));
+    });
+    $("hero").className = "card hero" + (s.mode.fast ? " fast" : "");
+    var num = $("coreNum");
+    num.textContent = String(total);
+    num.className = total ? "on" : "";
+    $("coreLbl").textContent = s.locked ? "shop locked" : (total ? "in stock" : "sold out");
+    var sum = $("summary");
+    while (sum.firstChild) sum.removeChild(sum.firstChild);
+    if (s.locked) sum.appendChild(document.createTextNode("Waiting for the shop to open"));
+    else if (live.length) sum.appendChild(document.createTextNode(live.join(" · ") + " available now"));
+    else sum.appendChild(document.createTextNode("Nothing available right now"));
+    sum.appendChild(el("small", "", "checking every " + Math.round(s.mode.interval) + "s"));
+  }
+  function updateProgress() {
+    if (!state || state.checked_ago === null) return;
+    var ago = state.checked_ago + (Date.now() - fetchedAt) / 1000;
+    var frac = Math.max(0, Math.min(1, ago / Math.max(2, state.mode.interval)));
+    $("progress").setAttribute("stroke-dashoffset", (RING * (1 - frac)).toFixed(2));
   }
 
+  // ---- sell-out clock ----
+  function makeClock(d, typical) {
+    var box = el("div", "clock"), txt = el("div", "txt"), track = el("div", "track"), fill = el("div", "fill");
+    track.appendChild(fill); box.appendChild(txt); box.appendChild(track);
+    clocks.push({ box: box, txt: txt, fill: fill, since: d.since, typical: typical, t0: Date.now() });
+    return box;
+  }
+  function updateClocks() {
+    clocks.forEach(function (c) {
+      var since = c.since + (Date.now() - c.t0) / 1000, left = c.typical - since;
+      if (left > 0) {
+        c.box.className = "clock";
+        c.txt.textContent = "Usually gone in " + dur(c.typical) + " · about " + dur(left) + " left";
+        c.fill.style.width = Math.max(2, Math.round(left / c.typical * 100)) + "%";
+      } else {
+        c.box.className = "clock late";
+        c.txt.textContent = "Past the usual " + dur(c.typical) + " · live for " + dur(since);
+        c.fill.style.width = "100%";
+      }
+    });
+  }
+
+  // ---- the full-screen buy button ----
+  function hideBig() { clearTimeout(bigTimer); $("big").className = "ovl"; }
+  function showBig(items) {
+    var big = $("big");
+    while (big.firstChild) big.removeChild(big.firstChild);
+    big.appendChild(el("div", "title", "Just in stock"));
+    items.slice(0, 3).forEach(function (d) {
+      var b = el("button", "bigbtn", "Buy " + d.shape + (d.size ? " · " + d.size : ""));
+      b.appendChild(el("small", "", d.product + (d.sgd ? " · " + d.sgd : "")));
+      b.addEventListener("click", function () { haptic("warning"); hideBig(); openUrl(d.buy); });
+      big.appendChild(b);
+    });
+    var x = el("button", "xbtn", "Close"); x.addEventListener("click", hideBig); big.appendChild(x);
+    big.className = "ovl show";
+    clearTimeout(bigTimer); bigTimer = setTimeout(hideBig, 25000);
+  }
+
+  // ---- the practice drill ----
+  function renderDrill(s) {
+    var d = s.drill, txt;
+    function sec(ms) { return ms ? (ms / 1000).toFixed(1) + " s" : "--"; }
+    if (!d.count) txt = "Race the clock: tap the size, pay, confirm. The clock is how fast " + d.shape + " really sells out (about " + dur(d.limit) + ").";
+    else txt = "Best " + sec(d.best) + " · average " + sec(d.avg) + " · " + d.count + " drill" + (d.count === 1 ? "" : "s") + "\n" + d.shape + " really sells out in about " + dur(d.limit);
+    $("drillStats").textContent = txt;
+  }
+  function clearDrillTimers() { drillTimers.forEach(function (t) { clearTimeout(t); clearInterval(t); }); drillTimers = []; }
+
+  function startDrill() {
+    var limit = Math.max(8, (state && state.drill && state.drill.limit) || 45);
+    var shape = (state && state.drill && state.drill.shape) || "KH1";
+    var box = $("drill");
+    box.className = "ovl show";
+    function clear() { while (box.firstChild) box.removeChild(box.firstChild); }
+    function button(text, cls, fn) { var b = el("button", cls, text); b.addEventListener("click", fn); return b; }
+    function close() { clearDrillTimers(); box.className = "ovl"; }
+
+    function wait() {
+      clearDrillTimers(); clear();
+      box.appendChild(el("div", "title", "Practice drop"));
+      box.appendChild(el("div", "dtext", "Get ready…\nit can start any second"));
+      box.appendChild(button("Cancel", "xbtn", close));
+      drillTimers.push(setTimeout(go, 2500 + Math.random() * 5500));
+    }
+
+    function go() {
+      var t0 = performance.now(), finished = false, stage = 1;
+      var timerText = el("div", "txt", ""), track = el("div", "track"), fill = el("div", "fill");
+      var clockBox = el("div", "clock"), area = el("div", "");
+      track.appendChild(fill); clockBox.appendChild(timerText); clockBox.appendChild(track);
+      haptic("warning"); clear();
+      box.appendChild(el("div", "title", shape + " in stock"));
+      box.appendChild(clockBox); box.appendChild(area);
+
+      function draw() {
+        while (area.firstChild) area.removeChild(area.firstChild);
+        if (stage === 1) area.appendChild(button(shape + "\n(tap the size)", "bigbtn", function () { stage = 2; haptic("warning"); draw(); }));
+        else if (stage === 2) area.appendChild(button("Pay with Apple Pay\n(tap to pay)", "bigbtn dark", function () { stage = 3; haptic("warning"); draw(); }));
+        else area.appendChild(button("Confirm with Face ID\n(tap to confirm)", "bigbtn dark", function () { finish(true); }));
+      }
+
+      function finish(won) {
+        if (finished) return;
+        finished = true; clearDrillTimers();
+        var ms = Math.round(performance.now() - t0), secs = ms / 1000;
+        clear();
+        box.appendChild(el("div", "title", won ? "Nice" : "Too slow"));
+        box.appendChild(el("div", "big" + (won ? "" : " bad"), won ? secs.toFixed(1) + " s" : "Sold out"));
+        box.appendChild(el("div", "dtext", won
+          ? "You paid with " + dur(limit - secs) + " to spare.\nA real " + shape + " sells out in about " + dur(limit) + "."
+          : "A real " + shape + " sells out in about " + dur(limit) + ". It was gone before you paid.\nTry again, you can go faster."));
+        haptic(won ? "success" : "error");
+        if (won) celebrate();
+        call("POST", "/api/drill", { ms: Math.max(300, ms), won: won }).then(render).catch(function () {});
+        box.appendChild(button("Again", "bigbtn", wait));
+        box.appendChild(button("Close", "xbtn", close));
+      }
+
+      draw();
+      drillTimers.push(setInterval(function () {
+        var s = (performance.now() - t0) / 1000, left = limit - s;
+        if (left <= 0) { finish(false); return; }
+        timerText.textContent = s.toFixed(1) + " s · gone in about " + dur(left);
+        fill.style.width = Math.round(left / limit * 100) + "%";
+      }, 100));
+    }
+    wait();
+  }
+
+  // ---- the lists ----
   function renderShapes(s) {
     var box = $("shapes");
+    clocks = [];
     while (box.firstChild) box.removeChild(box.firstChild);
     s.tiles.forEach(function (t) {
       var live = t.count > 0;
       var card = el("div", "shape " + (live ? "live" : "sold"));
       var top = el("div", "top");
-      top.appendChild(el("span", "", t.shape));
-      top.appendChild(el("span", "tag " + (live ? "live" : "sold"), live ? (t.count + " IN STOCK") : "SOLD OUT"));
+      top.appendChild(el("span", "nm", t.shape));
+      top.appendChild(el("span", "tag " + (live ? "live" : "sold"), live ? (t.count + " in stock") : "Sold out"));
       card.appendChild(top);
       t.live.forEach(function (d) {
         var row = el("div", "deck");
@@ -1438,26 +1715,27 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
         meta.appendChild(el("div", "name", d.product));
         meta.appendChild(el("div", "sub", [d.size, d.sgd].filter(Boolean).join(" · ")));
         row.appendChild(meta);
-        var b = el("button", "buy", "⚡ BUY");
+        var b = el("button", "buy", "Buy");
         b.addEventListener("click", function () { haptic("warning"); openUrl(d.buy); });
         row.appendChild(b);
         card.appendChild(row);
+        if (t.typical && d.since !== null) card.appendChild(makeClock(d, t.typical));
       });
       box.appendChild(card);
     });
   }
 
   function renderMode(s) {
-    var chip = $("chip");
-    var label = "CALM", cls = "calm";
-    if (s.locked) { label = "🔒 LOCKED"; cls = "lock"; }
-    else if (s.problem) { label = "⚠ LIMITED"; cls = "warn"; }
-    else if (s.mode.fast) { label = "⚡ DROP MODE"; cls = "fast"; }
-    chip.textContent = label; chip.className = "chip " + cls;
-    $("dropBtn").className = "btn" + (s.mode.fast ? " on" : "");
+    var chip = $("chip"), label = "Calm", cls = "pill";
+    if (s.locked) { label = "Locked"; cls = "pill lock"; }
+    else if (s.problem) { label = "Limited"; cls = "pill warn"; }
+    else if (s.mode.fast) { label = "Drop mode"; cls = "pill fast"; }
+    else if (s.tiles.some(function (t) { return t.count > 0; })) { label = "In stock"; cls = "pill live"; }
+    chip.className = cls; chip.lastChild.textContent = label;
+    $("dropBtn").className = "btn drop" + (s.mode.fast ? " on" : "");
     $("calmBtn").className = "btn calmBtn" + (!s.mode.fast ? " on" : "");
-    var note = "checking every " + Math.round(s.mode.interval) + "s";
-    if (s.mode.fast && s.mode.sticky) note += " · calm again after " + Math.round(s.mode.idle) + " min with no activity";
+    var note = "Checking every " + Math.round(s.mode.interval) + "s";
+    if (s.mode.fast && s.mode.sticky) note += " · back to calm after " + mins(s.mode.span) + " with no activity";
     if (s.problem) note += " · " + s.problem;
     $("modeNote").textContent = note;
   }
@@ -1473,7 +1751,6 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
     for (var i = 0; i < steps.length; i++) { if (sec <= steps[i][0]) return steps[i][1]; }
     return 12;
   }
-
   function renderReport(s) {
     var card = $("reportCard");
     if (!s.last_event) { card.style.display = "none"; return; }
@@ -1481,17 +1758,14 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
     $("reportName").textContent = s.last_event.product;
     var bars = $("reportBars");
     while (bars.firstChild) bars.removeChild(bars.firstChild);
-    var fastest = null;
     s.last_event.items.forEach(function (it) {
       var row = el("div", "bar");
       row.appendChild(el("div", "k", it.shape + (it.size ? " · " + it.size : "")));
       var track = el("div", "track"), fill = el("div", "fill");
-      var pct = it.gone === null ? 0 : speedPct(it.gone);
-      fill.style.width = pct + "%";
+      fill.style.width = (it.gone === null ? 0 : speedPct(it.gone)) + "%";
       track.appendChild(fill); row.appendChild(track);
       row.appendChild(el("div", "v", it.gone === null ? "live" : dur(it.gone)));
       bars.appendChild(row);
-      if (it.gone !== null && (fastest === null || it.gone < fastest)) fastest = it.gone;
     });
     $("heat").textContent = s.last_event.heat || "";
   }
@@ -1514,21 +1788,29 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
     if (!state) return;
     var ago = (state.checked_ago === null ? null : state.checked_ago + (Date.now() - fetchedAt) / 1000);
     var offline = (Date.now() - okAt) > 10000;
-    $("foot").textContent = offline ? "offline · reconnecting…"
-      : (ago === null ? "waiting for the first check" : "checked " + dur(ago) + " ago") + " · v" + state.version;
+    $("foot").textContent = offline ? "Offline · reconnecting…"
+      : (ago === null ? "Waiting for the first check" : "Checked " + dur(ago) + " ago") + " · v" + state.version;
     $("sNext").textContent = state.next_drop ? dur(Math.max(0, state.next_drop - Date.now() / 1000)) : "--";
+    updateClocks(); updateProgress();
   }
 
   function render(s) {
-    var live = {};
+    var live = {}, arrivedItems = [];
     s.tiles.forEach(function (t) { live[t.shape] = t.count; });
     var arrived = false;
-    if (prevLive) { for (var k in live) { if (live[k] > (prevLive[k] || 0)) arrived = true; } }
+    if (prevLive) {
+      s.tiles.forEach(function (t) {
+        if (t.count > (prevLive[t.shape] || 0)) {
+          arrived = true;
+          t.live.forEach(function (d) { arrivedItems.push({ shape: t.shape, size: d.size, product: d.product, sgd: d.sgd, buy: d.buy }); });
+        }
+      });
+    }
     prevLive = live;
     state = s; fetchedAt = Date.now(); okAt = fetchedAt;
     $("locked").style.display = "none"; $("app").style.display = "";
-    renderRadar(s); renderShapes(s); renderMode(s); renderStats(s); renderReport(s); renderParcels(s); tick();
-    if (arrived) celebrate();
+    renderGauge(s); renderShapes(s); renderMode(s); renderStats(s); renderReport(s); renderParcels(s); renderDrill(s); tick();
+    if (arrived) { celebrate(); showBig(arrivedItems); }
   }
 
   function showLocked() { $("app").style.display = "none"; $("locked").style.display = "block"; }
@@ -1545,6 +1827,7 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
 
   $("dropBtn").addEventListener("click", function () { haptic("warning"); call("POST", "/api/drop", { on: true }).then(render).catch(function () {}); });
   $("calmBtn").addEventListener("click", function () { call("POST", "/api/drop", { on: false }).then(render).catch(function () {}); });
+  $("drillBtn").addEventListener("click", function () { haptic("warning"); startDrill(); });
   document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
   setInterval(poll, 2000);
   setInterval(tick, 500);
@@ -1554,6 +1837,12 @@ footer{text-align:center;font-size:10px;color:var(--dim);letter-spacing:1px;marg
 </body>
 </html>
 """
+
+
+def page_html():
+    """The radar page, with the theme the bot is set to (auto follows Telegram's light or dark)."""
+    theme = RADAR_THEME if RADAR_THEME in ("dark", "light") else "auto"
+    return DASHBOARD_HTML.replace('data-theme="auto"', f'data-theme="{theme}"', 1)
 
 
 class RadarHandler(BaseHTTPRequestHandler):
@@ -1587,7 +1876,7 @@ class RadarHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self.reply(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+            self.reply(200, page_html(), "text/html; charset=utf-8")
         elif path == "/health":
             self.reply(200, "ok", "text/plain")
         elif path == "/api/state":
@@ -1598,7 +1887,7 @@ class RadarHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/api/drop":
+        if path not in ("/api/drop", "/api/drill"):
             self.reply(404, '{"error": "not found"}')
             return
         if not self.owner():
@@ -1609,8 +1898,16 @@ class RadarHandler(BaseHTTPRequestHandler):
         except Exception:
             self.reply(400, '{"error": "bad request"}')
             return
+        if path == "/api/drill":
+            ms = body.get("ms")
+            if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not 300 <= ms <= 600000:
+                self.reply(400, '{"error": "bad request"}')
+                return
+            record_drill(ms, bool(body.get("won")))
+            self.reply(200, json.dumps(dashboard_state()))
+            return
         if body.get("on"):
-            start_drop(DROP_IDLE_MINUTES, sticky=True)
+            start_drop(DROP_MANUAL_MINUTES, sticky=True)
         else:
             end_drop()
         self.reply(200, json.dumps(dashboard_state()))
@@ -1636,8 +1933,9 @@ def handle_radar():
     if markup:
         send_text(
             "📡 <h>Live radar</h>\n" + LINE + "\n"
-            "A live page inside Telegram: the four sizes, big BUY buttons, drop mode, "
-            "your pickups and parcels. It updates every 2 seconds from me, so it adds nothing to the shop.",
+            "A live page inside Telegram: the four sizes with a sell-out clock, a giant BUY button the moment "
+            "something lands, drop mode, your pickups and parcels, and a practice drill against your shop's real "
+            "sell-out times. It updates every 2 seconds from me, so it adds nothing to the shop.",
             markup,
         )
     else:
@@ -2642,7 +2940,7 @@ def send_test_alert():
 
 
 def handle_drop(argument):
-    """/drop            fast checking now, until DROP_IDLE_MINUTES of no activity
+    """/drop            fast checking now for 3 hours (DROP_MANUAL_MINUTES), longer while things happen
        /drop 45         fast checking now for 45 minutes
        /drop 20:00      fast from 19:50 to 21:00 (your time zone)
        /drop off        back to calm"""
@@ -2652,7 +2950,7 @@ def handle_drop(argument):
         send_text(f"🐢 <h>Calm mode</h>\n{LINE}\n{mode_line()}")
         return
     if not arg:
-        start_drop(DROP_IDLE_MINUTES, sticky=True)
+        start_drop(DROP_MANUAL_MINUTES, sticky=True)
     elif arg.replace(".", "", 1).isdigit():
         start_drop(min(float(arg), 720))
     elif ":" in arg:
@@ -2672,7 +2970,8 @@ def handle_drop(argument):
     else:
         send_text("🤔 Try <b>/drop</b>, <b>/drop 45</b> (minutes), <b>/drop 20:00</b> or <b>/drop off</b>.")
         return
-    idle = f"\n🕒 Back to calm after {DROP_IDLE_MINUTES:g} min with no activity." if DROP.get("sticky") else ""
+    idle = (f"\n🕒 On for {span_text(DROP_MANUAL_MINUTES)}, and longer while things are happening. "
+            "If it stays quiet I go back to calm by myself.") if DROP.get("sticky") else ""
     send_text(f"⚡ <h>Drop mode on</h>\n{LINE}\n{mode_line()}{idle}\n/calm switches it off.")
 
 
