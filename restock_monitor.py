@@ -23,7 +23,9 @@ Railway variables
   USD_TO_SGD            fixed exchange rate instead of the live one (optional)
   CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
-  BARK_KEY              optional: the Bark app's key, for a loud alert that breaks through Silent (see /alarm)
+  BARK_KEY              the Bark app's key: the loud alarm that breaks through Silent (see /alarm)
+  ALARM_AWAKE_MINUTES   no alarm for this long after you last used the bot or the live radar (default 30)
+  ALARM_MAX_MINUTES     the alarm gives up after this long with no tap (default 30, 0 = never)
   PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
   LIVE_RADAR            0 turns the live radar page off
   RADAR_THEME           auto (follows Telegram, default), dark or light
@@ -38,6 +40,7 @@ import json
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
@@ -56,7 +59,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "5.4 (12 Oct 2026)"
+VERSION = "5.5 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -2019,6 +2022,7 @@ class RadarHandler(BaseHTTPRequestHandler):
         if str(user.get("id")) != str(TELEGRAM_CHAT_ID):
             self.reply(403, '{"error": "not yours"}')
             return False
+        mark_awake()                                    # the live radar is open: you are up
         return True
 
     def do_GET(self):
@@ -2027,6 +2031,14 @@ class RadarHandler(BaseHTTPRequestHandler):
             self.reply(200, page_html(), "text/html; charset=utf-8")
         elif path == "/health":
             self.reply(200, "ok", "text/plain")
+        elif path.startswith("/awake/"):
+            target = awake_target(path[len("/awake/"):].strip("/"))
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif path == "/api/state":
             if self.owner():
                 self.reply(200, json.dumps(dashboard_state()))
@@ -2095,23 +2107,33 @@ def handle_radar():
 
 
 # ============================================================
-# ALARM: wake me up when a drop lands
-# Telegram alone can't ring through Silent mode or a Sleep Focus, so the alarm is loud:
-#   1. Wake-up messages every 3 seconds, until you tap "I'm awake" (one safety stop after an hour)
-#   2. A Bark alert (optional, set BARK_KEY): a critical alert that ignores Silent and Focus and
-#      loops its sound for 30 seconds, repeated while it rings
-# The night alarm (23:00 to 09:00 your time) has its own on/off button. It never rings for the
-# first read after a restart.
+# ALARM: wake me up when a drop lands, but only while I'm asleep
+# One loud Bark alert (it ignores Silent and Focus, and loops its sound for 30 seconds). Tap it and it
+# stops the alarm and opens the checkout in one go. It repeats every 30 seconds until you tap it.
+# It stays quiet while you are active: no alarm for 30 minutes after you last used the bot or the
+# live radar page. It never rings for the first read after a restart.
 # ============================================================
 
 BARK_KEY = os.getenv("BARK_KEY", "").strip()
 BARK_SERVER = os.getenv("BARK_SERVER", "https://api.day.app").rstrip("/")
 BARK_EVERY = 30                    # seconds between Bark alerts while it rings (one alert loops its sound for 30 s)
-ALARM_REPEAT_SECONDS = max(2, int(float(os.getenv("ALARM_REPEAT_SECONDS", "3"))))     # 2 to 3 seconds is a real spam
-ALARM_MAX_MINUTES = max(0.0, float(os.getenv("ALARM_MAX_MINUTES", "60")))      # safety stop, 0 = never
+ALARM_MAX_MINUTES = max(0.0, float(os.getenv("ALARM_MAX_MINUTES", "30")))      # gives up after this long, 0 = never
+ALARM_AWAKE_MINUTES = max(1.0, float(os.getenv("ALARM_AWAKE_MINUTES", "30")))  # quiet this long after you were active
 ALARM_ASYNC = True                 # the alarm runs on its own thread so the stock checks never wait for it
-ALARM = {"acked": False, "running": False, "headline": "", "buy": "", "ids": []}
+ALARM = {"acked": False, "running": False, "headline": "", "buy": "", "ids": [], "token": "", "token_t": 0.0}
+AWAKE = {"t": 0.0}                 # when you last used the bot or the live radar
 NIGHT_HOURS = "23-9"
+
+
+def mark_awake():
+    """A sign of life (a command, a button, the live radar open). It also stops an alarm that is ringing."""
+    AWAKE["t"] = time.time()
+    if ALARM["running"]:
+        ALARM["acked"] = True
+
+
+def user_awake():
+    return time.time() - AWAKE["t"] < ALARM_AWAKE_MINUTES * 60
 
 
 def alarm_settings():
@@ -2119,7 +2141,7 @@ def alarm_settings():
     if not isinstance(settings, dict):
         settings = {"on": False, "hours": NIGHT_HOURS}
         META["alarm"] = settings
-    elif settings == {"on": False, "hours": ""}:          # the old default: start with the night alarm
+    elif settings == {"on": False, "hours": ""}:          # the old default: start with the night hours
         settings["hours"] = NIGHT_HOURS
     return settings
 
@@ -2159,7 +2181,7 @@ def alarm_mode():
 
 def bark_push(title, body, url=""):
     """A Bark critical alert: ignores Silent and Do Not Disturb, plays at full volume and loops its sound
-    for 30 seconds. Returns Bark's answer as one short line, e.g. 'success'."""
+    for 30 seconds. Tapping it opens `url`. Returns Bark's answer as one short line, e.g. 'success'."""
     if not BARK_KEY:
         return ""
     payload = {"device_key": BARK_KEY, "title": title[:100], "body": body[:300], "level": "critical",
@@ -2188,27 +2210,6 @@ def bark_help(detail=""):
     )
 
 
-def test_bark_now():
-    """The 'Test Bark' button: sends one alert and tells you exactly what Bark answered."""
-    if not BARK_KEY:
-        send_text("📲 <h>Bark not set up</h>\n" + LINE + "\n"
-                  "Install Bark, copy its key, add <b>BARK_KEY</b> in Railway Variables, then deploy.")
-        return
-    try:
-        reply = bark_push("Knife Mfg Co: test", "This is a test of your drop alarm.")
-    except Exception as e:
-        detail = f"{type(e).__name__}: {e}"
-        log(f"Bark test failed: {detail}")
-        send_text(bark_help(detail))
-        return
-    if bark_problem(reply):
-        send_text(bark_help(reply))
-    else:
-        send_text("📲 <h>Test alert sent</h>\n" + LINE + "\n"
-                  "Your phone should sound within seconds, even on Silent. If it doesn't, check Bark's "
-                  "Critical Alerts setting in iPhone Settings, Notifications, Bark.")
-
-
 def alarm_headline(items):
     names = []
     for it in group_by_deck(items)[:2]:
@@ -2229,66 +2230,96 @@ def ack_alarm():
     return "Alarm off ✓"
 
 
+def awake_link(token):
+    """The address inside the Bark alert. Tapping it stops the alarm and sends the phone to the checkout."""
+    url = public_url()
+    return f"{url}/awake/{token}" if url else ""
+
+
+def awake_target(token):
+    """What happens when the alert is tapped: the alarm stops and the phone is sent to the checkout.
+    The token belongs to the latest alarm and works for an hour, so a second tap still reaches the checkout."""
+    token = str(token or "")
+    good = bool(token and ALARM.get("token")) and hmac.compare_digest(token, ALARM["token"]) \
+        and time.time() - float(ALARM.get("token_t") or 0) < 3600
+    if not good:
+        return SITE
+    ALARM["acked"] = True
+    AWAKE["t"] = time.time()
+    return ALARM.get("buy") or SITE
+
+
 def alarm_run(items, test=False):
-    """One alarm. Wake-up messages every few seconds with no limit until you tap 'I'm awake'
-    (a test stops after 3, and a safety stop ends it after ALARM_MAX_MINUTES)."""
-    ALARM.update(acked=False, running=True, ids=[it["id"] for it in items],
+    """One alarm: a Bark alert now and every 30 seconds until you tap it (a test sends 3, and a safety stop
+    ends a real one after ALARM_MAX_MINUTES). Failures are explained once in Telegram."""
+    token = secrets.token_urlsafe(12)
+    ALARM.update(acked=False, running=True, ids=[it["id"] for it in items], token=token, token_t=time.time(),
                  headline="TEST · this is only a test" if test else alarm_headline(items),
                  buy=SITE if test else items[0]["cart_url"])
-    max_messages = 3 if test else (int(ALARM_MAX_MINUTES * 60 / ALARM_REPEAT_SECONDS) if ALARM_MAX_MINUTES else 0)
-    started = time.time()
-    number = 0
+    link = awake_link(token)
+    max_sends = 3 if test else (int(ALARM_MAX_MINUTES * 60 / BARK_EVERY) if ALARM_MAX_MINUTES else 0)
+    if not link:                                      # nothing can tell me it was tapped: do not keep ringing
+        max_sends = min(max_sends or 3, 3)
+    sends = fails = 0
+    told = False
     outcome = "acked"
-    bark_told = False
-    bark_every = max(1, int(BARK_EVERY / ALARM_REPEAT_SECONDS))
+    started = time.time()
     try:
+        if not link and not test:
+            send_text("⚠️ <h>No web address yet</h>\n" + LINE + "\nTapping the alert will open the checkout, but I can't "
+                      "tell it was tapped, so it only rings 3 times. Add a Railway domain to fix that (see /radar).")
         while not ALARM["acked"]:
-            if max_messages and number >= max_messages:
+            if max_sends and sends >= max_sends:
                 outcome = "stopped"
                 break
-            number += 1
-            if BARK_KEY and (number == 1 or number % bark_every == 0):
-                try:
-                    reply = bark_push("Knife Mfg Co: TEST" if test else "Knife Mfg Co: IN STOCK", ALARM["headline"], ALARM["buy"])
-                    bark_failed = bark_problem(reply)
-                except Exception as e:
-                    log(f"Bark alert failed: {e}")
-                    reply, bark_failed = f"{type(e).__name__}: {e}", True
-                if not bark_told and (bark_failed or (test and number == 1)):
-                    bark_told = True
-                    send_text(bark_help(reply) if bark_failed else "📲 Bark alert sent. Your phone should be sounding.")
+            sends += 1
             sold = (not test) and alarm_gone(ALARM["ids"])
-            send_text(
-                f"🚨🚨 <h>WAKE UP</h> 🚨🚨\n{LINE}\n{esc(ALARM['headline'])}\n"
-                + ("This is only a test." if test else ("💨 It may be sold out already." if sold else "In stock right now."))
-                + f"\n#{number} · ringing for {human(time.time() - started)}",
-                {"inline_keyboard": [
-                    [{"text": btn("⚡ Buy now"), "url": ALARM["buy"]}],
-                    [{"text": btn("✅ I'm awake"), "callback_data": "al:ack"}],
-                ]},
-            )
-            for _ in range(ALARM_REPEAT_SECONDS):
+            body = ALARM["headline"] + (" · may be sold out" if sold else "") + "\nTap to stop and buy."
+            try:
+                reply = bark_push("Knife Mfg Co: TEST" if test else "Knife Mfg Co: IN STOCK", body, link or ALARM["buy"])
+                failed = bark_problem(reply)
+            except Exception as e:
+                log(f"Bark alert failed: {e}")
+                reply, failed = f"{type(e).__name__}: {e}", True
+            if failed:
+                fails += 1
+                if not told:
+                    told = True
+                    send_text(bark_help(reply))
+                if fails >= 3:
+                    outcome = "failed"
+                    break
+            else:
+                fails = 0
+            for _ in range(BARK_EVERY):
                 if ALARM["acked"]:
                     break
                 time.sleep(1)
         if outcome == "acked":
-            send_text("✅ <h>Alarm off</h>\n" + LINE + "\nGood luck!")
+            if test:
+                send_text("✅ <h>It works</h>\n" + LINE + "\nYou tapped the test alert: it stopped, and the shop opened.")
+        elif outcome == "failed":
+            send_text("⏹ <h>Alarm stopped</h>\n" + LINE + "\nBark kept failing. Check the key, then try the test again.")
+        elif test:
+            send_text("⏹ <h>Test finished</h>\n" + LINE + "\nNobody tapped it. Tap the alert next time: it stops and opens the shop.")
         else:
             send_text("⏹ <h>Alarm stopped</h>\n" + LINE
-                      + ("\nThat was the test." if test else f"\nNo answer for {human(time.time() - started)}, so I stopped "
-                         "as a safety. Tap Alarm in /panel to check it."))
+                      + f"\nNo tap for {human(time.time() - started)}, so I stopped as a safety. "
+                        "Check the alarm in /panel.")
     finally:
         ALARM["running"] = False
 
 
 def ring_alarm(items, test=False):
-    """Called right after a drop alert was delivered. Does nothing unless the alarm is on and inside its hours.
-    If an alarm is already ringing, it just switches to the newest drop."""
+    """Called right after a drop alert was delivered. Rings only if the alarm is on, it is inside its hours,
+    Bark is set up and you have been away for a while. If an alarm is already ringing it switches to the newest drop."""
     if not test:
-        if not alarm_active():
+        if not (alarm_active() and BARK_KEY):
             return
         if ALARM["running"]:
             ALARM.update(ids=[it["id"] for it in items], headline=alarm_headline(items), buy=items[0]["cart_url"])
+            return
+        if user_awake():
             return
     elif ALARM["running"]:
         return
@@ -2331,24 +2362,26 @@ def alarm_summary():
 
 
 def alarm_text():
-    return "\n".join([
-        "🚨 <h>Alarm</h>",
+    lines = ["🚨 <h>Alarm</h>", LINE, alarm_summary()]
+    if not BARK_KEY:
+        lines.append("📲 Bark not set up: add BARK_KEY in Railway")
+    elif not public_url():
+        lines.append("⚠️ No web address yet: the alert can't tell it was tapped (see /radar)")
+    lines += [
+        f"😴 Rings only if you haven't used the bot for {ALARM_AWAKE_MINUTES:g} min",
         LINE,
-        alarm_summary(),
-        ("📲 Bark alert: ready" if BARK_KEY else "📲 Bark alert: not set up"),
-        LINE,
-        f"When a drop lands I send wake-up messages every {ALARM_REPEAT_SECONDS} seconds, with no limit, "
-        "until you tap I'm awake.",
-    ])
+        "One loud alert. Tap it: it stops, and the checkout opens.",
+    ]
+    return "\n".join(lines)
 
 
 def alarm_markup():
     mode = alarm_mode()
+    night_only = (alarm_settings().get("hours") or "") != ""
     return {"inline_keyboard": [
-        [{"text": btn(f"🌙 Night alarm 23:00-09:00: {'On' if mode == 'night' else 'Off'}"), "callback_data": "al:night"}],
-        [{"text": btn(f"🔔 Any hour: {'On' if mode == 'always' else 'Off'}"), "callback_data": "al:always"},
-         {"text": btn("🧪 Test"), "callback_data": "al:test"}],
-        [{"text": btn("📲 Test Bark"), "callback_data": "al:bark"},
+        [{"text": btn(f"📲 Alarm: {'Off' if mode == 'off' else 'On'}"), "callback_data": "al:toggle"}],
+        [{"text": btn(f"🌙 Only 23:00-09:00: {'On' if night_only else 'Off'}"), "callback_data": "al:hours"}],
+        [{"text": btn("🧪 Test"), "callback_data": "al:test"},
          {"text": btn("◀ Panel"), "callback_data": "pn:home"}],
     ]}
 
@@ -2357,24 +2390,33 @@ def test_alarm_items():
     return [{"id": "test", "product": "Test Deck", "shape": "KH1", "handle": "test", "cart_url": SITE}]
 
 
+def switch_alarm(settings, on):
+    """Turns the alarm on or off. It can't be on without Bark. Returns (changed, pop-up text)."""
+    if on and not BARK_KEY:
+        return False, "Set up Bark first (BARK_KEY)"
+    settings["on"] = on
+    return True, "Alarm on 📲" if on else "Alarm off"
+
+
 def handle_alarm_tap(query, data):
     """A button on the alarm screen. Returns the little pop-up text."""
     key = data[3:]
     settings = alarm_settings()
-    if key == "night":
-        if alarm_mode() == "night":
-            settings["on"], toast = False, "Night alarm off"
-        else:
-            settings["on"], settings["hours"], toast = True, NIGHT_HOURS, "Night alarm on 🌙"
+    if key == "toggle":
+        changed, toast = switch_alarm(settings, not settings.get("on"))
+    elif key == "hours":
+        settings["hours"] = "" if settings.get("hours") else NIGHT_HOURS
+        toast = "Rings only 23:00 to 09:00 🌙" if settings["hours"] else "Rings at any hour"
+    elif key == "night":                                # older buttons still in the chat
+        _, toast = switch_alarm(settings, True)
+        settings["hours"] = NIGHT_HOURS
     elif key == "always":
-        if alarm_mode() == "always":
-            settings["on"], toast = False, "Alarm off"
-        else:
-            settings["on"], settings["hours"], toast = True, "", "Alarm on at any hour 🔔"
-    elif key == "on":                                   # older buttons still in the chat
-        settings["on"], toast = True, "Alarm on"
+        _, toast = switch_alarm(settings, True)
+        settings["hours"] = ""
+    elif key == "on":
+        _, toast = switch_alarm(settings, True)
     elif key == "off":
-        settings["on"], toast = False, "Alarm off"
+        _, toast = switch_alarm(settings, False)
     elif key.startswith("h:"):
         value = key[2:]
         try:
@@ -2382,15 +2424,11 @@ def handle_alarm_tap(query, data):
         except Exception:
             return "✓"
         settings["hours"], toast = ("" if value == "all" else value), "Hours set"
-    elif key == "test":
+    elif key in ("test", "bark"):
         ring_alarm(test_alarm_items(), test=True)
-        toast = "Test alarm started"
-    elif key == "bark":
-        if ALARM_ASYNC:
-            threading.Thread(target=test_bark_now, daemon=True).start()
-        else:
-            test_bark_now()
-        return "Sending…"
+        toast = "Test alert sent 📲" if BARK_KEY else "Set up Bark first (BARK_KEY)"
+    elif key == "ack":
+        return ack_alarm()
     else:
         return "✓"
     save_meta()
@@ -2399,15 +2437,21 @@ def handle_alarm_tap(query, data):
 
 
 def handle_alarm(argument):
-    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test, /alarm bark."""
+    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test."""
     parts = argument.strip().lower().split()
     settings = alarm_settings()
     if parts and parts[0] in ("on", "off"):
-        settings["on"] = parts[0] == "on"
+        changed, toast = switch_alarm(settings, parts[0] == "on")
+        if not changed:
+            send_text("📲 <h>Bark not set up</h>\n" + LINE + "\nInstall Bark, copy its key, add <b>BARK_KEY</b> in Railway "
+                      "Variables and deploy. Then switch the alarm on here.", alarm_markup())
+            return
         save_meta()
     elif parts and parts[0] == "night":
-        settings["on"], settings["hours"] = True, NIGHT_HOURS
-        save_meta()
+        changed, toast = switch_alarm(settings, True)
+        if changed:
+            settings["hours"] = NIGHT_HOURS
+            save_meta()
     elif parts and parts[0] == "hours" and len(parts) >= 2:
         try:
             parse_hours(parts[1])
@@ -2416,11 +2460,12 @@ def handle_alarm(argument):
             return
         settings["hours"] = "" if parts[1] in ("all", "always") else parts[1]
         save_meta()
-    elif parts and parts[0] == "test":
+    elif parts and parts[0] in ("test", "bark"):
+        if not BARK_KEY:
+            send_text("📲 <h>Bark not set up</h>\n" + LINE + "\nInstall Bark, copy its key, add <b>BARK_KEY</b> in Railway "
+                      "Variables and deploy.")
+            return
         ring_alarm(test_alarm_items(), test=True)
-        return
-    elif parts and parts[0] == "bark":
-        test_bark_now()
         return
     elif parts:
         send_text("🤔 I didn't understand that. Use the buttons below.", alarm_markup())
@@ -2487,9 +2532,9 @@ def handle_panel_tap(query, data):
             toast = "Drop mode on ⚡"
     elif key == "alarm":
         settings = alarm_settings()
-        settings["on"] = not settings.get("on")
-        save_meta()
-        toast = "Alarm on" if settings["on"] else "Alarm off"
+        changed, toast = switch_alarm(settings, not settings.get("on"))
+        if changed:
+            save_meta()
     elif key == "smart":
         META["smart"] = not smart_on()
         save_meta()
@@ -3695,6 +3740,7 @@ def handle_callback(query):
     if chat_id != str(TELEGRAM_CHAT_ID):
         return
     touch_activity()
+    mark_awake()
     data = query.get("data", "")
 
     if data.startswith("so:"):
@@ -3762,6 +3808,7 @@ def telegram_listener(offset):
                 if not message or str(message.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
                     continue                    # only your own chat
                 touch_activity()
+                mark_awake()
                 text = (message.get("text") or "").strip()
                 if not text.startswith("/"):
                     continue
@@ -3819,7 +3866,7 @@ def telegram_listener(offset):
 MENU_COMMANDS = [
     ("panel", "Control panel with buttons"),
     ("status", "Stock right now"),
-    ("alarm", "Wake me up when a drop lands"),
+    ("alarm", "Loud alarm for drops while I sleep"),
     ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
     ("autodrop", "Auto drop mode on or off"),
