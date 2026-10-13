@@ -23,7 +23,7 @@ Railway variables
   USD_TO_SGD            fixed exchange rate instead of the live one (optional)
   CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
                         ADDRESS, CITY, ZIP, COUNTRY, PHONE)
-  CALLMEBOT_USER        optional: a Telegram voice call to your @username (see /alarm)
+  BARK_KEY              optional: the Bark app's key, for a loud alert that breaks through Silent (see /alarm)
   PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
   LIVE_RADAR            0 turns the live radar page off
   RADAR_THEME           auto (follows Telegram, default), dark or light
@@ -56,7 +56,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "5.0 (12 Oct 2026)"
+VERSION = "5.4 (12 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -2097,17 +2097,18 @@ def handle_radar():
 # ============================================================
 # ALARM: wake me up when a drop lands
 # Telegram alone can't ring through Silent mode or a Sleep Focus, so the alarm is loud:
-#   1. Wake-up messages every 10 seconds, with no limit, until you tap "I'm awake"
-#   2. A Telegram voice call from CallMeBot every 3 minutes (optional, set CALLMEBOT_USER)
+#   1. Wake-up messages every 3 seconds, until you tap "I'm awake" (one safety stop after an hour)
+#   2. A Bark alert (optional, set BARK_KEY): a critical alert that ignores Silent and Focus and
+#      loops its sound for 30 seconds, repeated while it rings
 # The night alarm (23:00 to 09:00 your time) has its own on/off button. It never rings for the
 # first read after a restart.
 # ============================================================
 
-CALLMEBOT_USER = os.getenv("CALLMEBOT_USER", "").strip()
-CALLMEBOT_BASE = os.getenv("CALLMEBOT_BASE", "https://api.callmebot.com").rstrip("/")
-ALARM_REPEAT_SECONDS = max(5, int(float(os.getenv("ALARM_REPEAT_SECONDS", "10"))))
-ALARM_MAX_MINUTES = max(0.0, float(os.getenv("ALARM_MAX_MINUTES", "180")))     # safety stop, 0 = never
-ALARM_CALL_EVERY = 180             # seconds between phone calls while it rings
+BARK_KEY = os.getenv("BARK_KEY", "").strip()
+BARK_SERVER = os.getenv("BARK_SERVER", "https://api.day.app").rstrip("/")
+BARK_EVERY = 30                    # seconds between Bark alerts while it rings (one alert loops its sound for 30 s)
+ALARM_REPEAT_SECONDS = max(2, int(float(os.getenv("ALARM_REPEAT_SECONDS", "3"))))     # 2 to 3 seconds is a real spam
+ALARM_MAX_MINUTES = max(0.0, float(os.getenv("ALARM_MAX_MINUTES", "60")))      # safety stop, 0 = never
 ALARM_ASYNC = True                 # the alarm runs on its own thread so the stock checks never wait for it
 ALARM = {"acked": False, "running": False, "headline": "", "buy": "", "ids": []}
 NIGHT_HOURS = "23-9"
@@ -2156,13 +2157,56 @@ def alarm_mode():
     return "night" if hours == NIGHT_HOURS else ("always" if hours == "" else "custom")
 
 
-def callmebot_call(text):
-    """A Telegram voice call that reads the text twice. Needs CallMeBot authorised once."""
-    if not CALLMEBOT_USER:
+def bark_push(title, body, url=""):
+    """A Bark critical alert: ignores Silent and Do Not Disturb, plays at full volume and loops its sound
+    for 30 seconds. Returns Bark's answer as one short line, e.g. 'success'."""
+    if not BARK_KEY:
+        return ""
+    payload = {"device_key": BARK_KEY, "title": title[:100], "body": body[:300], "level": "critical",
+               "volume": 10, "call": "1", "sound": "alarm", "group": "knife-radar"}
+    if url:
+        payload["url"] = url
+    request = urllib.request.Request(
+        f"{BARK_SERVER}/push", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+    with urllib.request.urlopen(request, timeout=15) as response:
+        reply = json.loads(response.read().decode("utf-8", "ignore") or "{}")
+    code = reply.get("code")
+    return "success" if code == 200 else f"error {code}: {reply.get('message') or 'no message'}"
+
+
+def bark_problem(reply):
+    return not str(reply or "").startswith("success")
+
+
+def bark_help(detail=""):
+    return (
+        "📲 <h>The Bark alert didn't go through</h>\n" + LINE + "\n"
+        + (f"Bark said: <i>{esc(detail)}</i>\n" if detail else "")
+        + "Check: <b>BARK_KEY</b> is the key from the Bark app (the code after <b>day.app/</b> in its test address), "
+        "and Bark is allowed to send Critical Alerts in iPhone Settings, Notifications, Bark."
+    )
+
+
+def test_bark_now():
+    """The 'Test Bark' button: sends one alert and tells you exactly what Bark answered."""
+    if not BARK_KEY:
+        send_text("📲 <h>Bark not set up</h>\n" + LINE + "\n"
+                  "Install Bark, copy its key, add <b>BARK_KEY</b> in Railway Variables, then deploy.")
         return
-    query = urllib.parse.urlencode({"user": CALLMEBOT_USER, "text": text[:250], "lang": "en-GB-Standard-B", "rpt": 2})
-    with urllib.request.urlopen(f"{CALLMEBOT_BASE}/start.php?{query}", timeout=20) as response:
-        response.read()
+    try:
+        reply = bark_push("Knife Mfg Co: test", "This is a test of your drop alarm.")
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}"
+        log(f"Bark test failed: {detail}")
+        send_text(bark_help(detail))
+        return
+    if bark_problem(reply):
+        send_text(bark_help(reply))
+    else:
+        send_text("📲 <h>Test alert sent</h>\n" + LINE + "\n"
+                  "Your phone should sound within seconds, even on Silent. If it doesn't, check Bark's "
+                  "Critical Alerts setting in iPhone Settings, Notifications, Bark.")
 
 
 def alarm_headline(items):
@@ -2192,22 +2236,27 @@ def alarm_run(items, test=False):
                  headline="TEST · this is only a test" if test else alarm_headline(items),
                  buy=SITE if test else items[0]["cart_url"])
     max_messages = 3 if test else (int(ALARM_MAX_MINUTES * 60 / ALARM_REPEAT_SECONDS) if ALARM_MAX_MINUTES else 0)
-    call_every = max(1, int(ALARM_CALL_EVERY / ALARM_REPEAT_SECONDS))
     started = time.time()
     number = 0
     outcome = "acked"
+    bark_told = False
+    bark_every = max(1, int(BARK_EVERY / ALARM_REPEAT_SECONDS))
     try:
         while not ALARM["acked"]:
             if max_messages and number >= max_messages:
                 outcome = "stopped"
                 break
             number += 1
-            if number == 1 or number % call_every == 0:
+            if BARK_KEY and (number == 1 or number % bark_every == 0):
                 try:
-                    callmebot_call("This is a test of your drop alarm." if test
-                                   else "Knife M F G drop! " + ALARM["headline"])
+                    reply = bark_push("Knife Mfg Co: TEST" if test else "Knife Mfg Co: IN STOCK", ALARM["headline"], ALARM["buy"])
+                    bark_failed = bark_problem(reply)
                 except Exception as e:
-                    log(f"CallMeBot call failed: {e}")
+                    log(f"Bark alert failed: {e}")
+                    reply, bark_failed = f"{type(e).__name__}: {e}", True
+                if not bark_told and (bark_failed or (test and number == 1)):
+                    bark_told = True
+                    send_text(bark_help(reply) if bark_failed else "📲 Bark alert sent. Your phone should be sounding.")
             sold = (not test) and alarm_gone(ALARM["ids"])
             send_text(
                 f"🚨🚨 <h>WAKE UP</h> 🚨🚨\n{LINE}\n{esc(ALARM['headline'])}\n"
@@ -2286,7 +2335,7 @@ def alarm_text():
         "🚨 <h>Alarm</h>",
         LINE,
         alarm_summary(),
-        ("📞 Phone call: ready" if CALLMEBOT_USER else "📞 Phone call: not set up"),
+        ("📲 Bark alert: ready" if BARK_KEY else "📲 Bark alert: not set up"),
         LINE,
         f"When a drop lands I send wake-up messages every {ALARM_REPEAT_SECONDS} seconds, with no limit, "
         "until you tap I'm awake.",
@@ -2299,7 +2348,8 @@ def alarm_markup():
         [{"text": btn(f"🌙 Night alarm 23:00-09:00: {'On' if mode == 'night' else 'Off'}"), "callback_data": "al:night"}],
         [{"text": btn(f"🔔 Any hour: {'On' if mode == 'always' else 'Off'}"), "callback_data": "al:always"},
          {"text": btn("🧪 Test"), "callback_data": "al:test"}],
-        [{"text": btn("◀ Panel"), "callback_data": "pn:home"}],
+        [{"text": btn("📲 Test Bark"), "callback_data": "al:bark"},
+         {"text": btn("◀ Panel"), "callback_data": "pn:home"}],
     ]}
 
 
@@ -2335,6 +2385,12 @@ def handle_alarm_tap(query, data):
     elif key == "test":
         ring_alarm(test_alarm_items(), test=True)
         toast = "Test alarm started"
+    elif key == "bark":
+        if ALARM_ASYNC:
+            threading.Thread(target=test_bark_now, daemon=True).start()
+        else:
+            test_bark_now()
+        return "Sending…"
     else:
         return "✓"
     save_meta()
@@ -2343,7 +2399,7 @@ def handle_alarm_tap(query, data):
 
 
 def handle_alarm(argument):
-    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test."""
+    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test, /alarm bark."""
     parts = argument.strip().lower().split()
     settings = alarm_settings()
     if parts and parts[0] in ("on", "off"):
@@ -2362,6 +2418,9 @@ def handle_alarm(argument):
         save_meta()
     elif parts and parts[0] == "test":
         ring_alarm(test_alarm_items(), test=True)
+        return
+    elif parts and parts[0] == "bark":
+        test_bark_now()
         return
     elif parts:
         send_text("🤔 I didn't understand that. Use the buttons below.", alarm_markup())
