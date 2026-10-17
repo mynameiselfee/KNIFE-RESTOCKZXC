@@ -1,35 +1,65 @@
 """
 KNIFE MFG CO DECK RADAR
-Watches knifemfg.co for KH1 / KL2 / KL1 / KB1 decks and alerts you on Telegram.
+Watches knifemfg.co for the KH1, KL2, KL1 and KB1 decks and tells you on Telegram the moment one
+is in stock, with a button that opens a pre-filled checkout for your size.
 
-Railway variables
+What it does
+  - Checks the shop every 20 seconds (calm) or every 4 seconds (drop mode), gently: it asks
+    "has anything changed?" first, slows itself down if the shop pushes back (429), and
+    remembers that across restarts.
+  - A drop is ONE tidy message that updates by itself, then turns into the drop report.
+  - Shop news: one message when a new product, a new size or a new price shows up.
+  - A loud night alarm (Bark) that only rings while you are asleep. One tap stops it and opens
+    the checkout.
+  - A live radar page inside Telegram, a control panel with buttons, pickups and parcel tracking.
+
+Railway variables (only the first two are required)
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    required
-  CHECK_INTERVAL        seconds between checks in calm mode (default 20, minimum 2)
-  DROP_INTERVAL         seconds between checks in drop mode (default 4, minimum 2)
-  DROP_MANUAL_MINUTES   how long /drop keeps drop mode on (default 180 = 3 hours)
-  DROP_IDLE_MINUTES     automatic drop mode (restock, shop opens) goes back to calm after this long quiet (default 60)
-  LOG_EVERY             1 = log every check (default 60, about every 5 min)
-  STARTUP_PING          0 turns off the "radar online" message
-  ALERT_ON_START        0 = stay silent about decks already in stock at start-up
-  DAILY_PING_HOUR       0-23: one "still watching" message a day (off by default)
-  TZ_OFFSET_HOURS       hours from UTC for the daily ping (default 8, Singapore)
-  PASSWORD_TTL_HOURS    forget a /password after this long (default 24, 0 = never)
-  SHOP_PASSWORD         shop password that never expires (optional)
-  USPS_CLIENT_ID / USPS_CLIENT_SECRET   free USPS keys, for parcel updates (see /track)
-  PARCELS_API_KEY       Parcels App key (parcelsapp.com): covers the last leg abroad
-  PARCEL_COUNTRY        where parcels are going (default SG)
-  PARCEL_CHECK_MINUTES  how often parcels are checked (default 60)
-  PARCEL_DAILY_HOUR     0-23: one parcel summary a day (default 9, empty = off)
-  USD_TO_SGD            fixed exchange rate instead of the live one (optional)
-  CHECKOUT_*            details to pre-fill checkout (EMAIL, FIRST_NAME, LAST_NAME,
-                        ADDRESS, CITY, ZIP, COUNTRY, PHONE)
-  BARK_KEY              the Bark app's key: the loud alarm that breaks through Silent (see /alarm)
-  ALARM_AWAKE_MINUTES   no alarm for this long after you last used the bot or the live radar (default 30)
-  ALARM_MAX_MINUTES     the alarm gives up after this long with no tap (default 30, 0 = never)
-  PUBLIC_URL            https address of the live radar page (Railway fills it in by itself)
-  LIVE_RADAR            0 turns the live radar page off
-  RADAR_THEME           auto (follows Telegram, default), dark or light
-  SHOP_URL              only for testing against a fake shop
+  Speed
+    CHECK_INTERVAL        seconds between checks in calm mode (default 20, minimum 2)
+    DROP_INTERVAL         seconds between checks in drop mode (default 4, minimum 2)
+    DROP_MANUAL_MINUTES   how long /drop keeps drop mode on (default 180)
+    DROP_IDLE_MINUTES     automatic drop mode goes back to calm after this long quiet (default 60)
+    AUTO_DROP_MAX_MINUTES stock that just stays there keeps drop mode on at most this long (default 120)
+    CACHE_BUSTER          0 = never ask for a fresh copy of the product list in drop mode
+  Buying
+    CHECKOUT_*            pre-fills checkout: EMAIL, FIRST_NAME, LAST_NAME, ADDRESS, CITY, ZIP,
+                          COUNTRY, PHONE
+    USD_TO_SGD            a fixed exchange rate instead of the live one (optional)
+    SHOP_PASSWORD         a shop password that never expires (optional, see /password)
+    PASSWORD_TTL_HOURS    forget a /password after this long (default 24, 0 = never)
+  Alarm
+    BARK_KEY              the Bark app's key: the loud alarm that breaks through Silent (see /alarm)
+    ALARM_AWAKE_MINUTES   no alarm for this long after you last used the bot or the radar (default 30)
+    ALARM_MAX_MINUTES     the alarm gives up after this long with no tap (default 30, 0 = never)
+  Parcels
+    PARCELS_API_KEY       Parcels App key (parcelsapp.com)
+    USPS_CLIENT_ID / USPS_CLIENT_SECRET   free USPS keys (optional)
+    PARCEL_COUNTRY        where parcels are going (default SG)
+    PARCEL_CHECK_MINUTES  how often parcels are checked (default 60)
+    PARCEL_DAILY_HOUR     0-23: one parcel summary a day (default 9, empty = off)
+  Messages and look
+    STARTUP_PING          0 turns off the "radar online" message
+    ALERT_ON_START        0 = stay silent about decks already in stock at start-up
+    DAILY_PING_HOUR       0-23: one "still watching" message a day (off by default)
+    TZ_OFFSET_HOURS       your hours from UTC (default 8, Singapore)
+    FONT_STYLE            lettering for headings: plain (default), smallcaps, sans, serif, mono, ...
+    BUTTON_STYLE          lettering for buttons (empty = same as FONT_STYLE)
+    LOG_EVERY             1 = log every check (default 60)
+  Live radar page
+    LIVE_RADAR            0 turns the page off
+    RADAR_THEME           auto (follows Telegram, default), dark or light
+    PUBLIC_URL            the page's https address (Railway fills in RAILWAY_PUBLIC_DOMAIN by itself)
+    PORT                  the port the page listens on (Railway sets it, default 8080)
+  For testing only
+    SHOP_URL, STATE_FILE, BARK_SERVER, PARCELS_BASE, USPS_BASE
+
+Commands: /panel has buttons for everything. /help lists the typed commands.
+
+Sections in this file
+  CONFIG · MEMORY · PRICES · CHECKOUT LINKS · READING THE SHOP · SHOP PASSWORD · TELEGRAM ·
+  ALERTS · DROP BOARD · SHOP NEWS · DROP INTELLIGENCE · LIVE RADAR · ALARM · CONTROL PANEL ·
+  MY PICKUPS · PARCELS · STATUS AND HELP · STOCK CHECK · COMMANDS · MAIN
 """
 import gzip
 import hashlib
@@ -59,7 +89,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "5.5 (12 Oct 2026)"
+VERSION = "6.0 (13 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -166,7 +196,7 @@ def render(text):
 
 
 # ============================================================
-# MEMORY (state file)
+# MEMORY
 # ============================================================
 
 def pick_state_file():
@@ -196,7 +226,8 @@ STATE = {}               # variant_id -> was in stock when last alerted/seen
 CURRENT_SNAPSHOT = {}    # variant_id -> item dict
 DATA_LOCK = threading.Lock()
 LAST_CHECK = 0.0         # when the shop was last read successfully
-META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "alarm": {"on": False, "hours": ""}, "auto_drop": True}
+META = {"last_drop": None, "shop_password": "", "shop_password_t": 0, "last_daily": "", "purchases": [], "parcels": [], "last_parcel_digest": "", "events": [], "smart": True, "smart_last": 0, "watches": [], "alarm": {"on": False, "hours": "23-9"}, "auto_drop": True,
+        "board": True, "news": True, "seen": {}, "prices": {}}
 
 
 def _write_json(path, data):
@@ -246,7 +277,8 @@ def save_meta():
 
 
 # ============================================================
-# PRICES: USD -> SGD
+# PRICES
+# Prices are shown in Singapore dollars, from the live USD rate.
 # ============================================================
 
 FX_FIXED = bool(os.getenv("USD_TO_SGD"))
@@ -406,7 +438,7 @@ AUTO = {"since": 0.0}
 
 
 def auto_drop_on():
-    return bool(META.get("auto_drop", True))
+    return switch_on("autodrop")
 
 
 def auto_start_drop():
@@ -780,7 +812,8 @@ def build_snapshot(products):
 
 
 # ============================================================
-# SHOP PASSWORD (you give it to me with /password)
+# SHOP PASSWORD
+# You give it to me with /password.
 # ============================================================
 
 PW = {"bad": None, "last_try": 0.0, "using": False}
@@ -1029,6 +1062,11 @@ def send_alert(group, test=False):
 
 def send_alerts(items):
     """Sends the alerts and returns the variant ids Telegram accepted."""
+    if board_on():
+        try:
+            return board_arrive(items)
+        except Exception as e:                       # never let the board stand between you and an alert
+            log(f"Drop board failed ({e}), sending classic alerts instead")
     groups = group_by_deck(items)
     shown, rest = groups[:MAX_ALERTS_PER_DROP], groups[MAX_ALERTS_PER_DROP:]
     delivered = set()
@@ -1057,6 +1095,13 @@ def send_test_alerts(items):
     if not items:
         send_text("⏳ No data yet, try again in a few seconds.")
         return
+    if board_on():
+        live = [it for it in items if it["available"]]
+        if not live:
+            first = items[0]
+            live = [it for it in items if it["handle"] == first["handle"]][:2]
+        board_preview(live)
+        return
     live = [it for it in items if it["available"]]
     if not live:
         send_text("🧪 <h>TEST</h> · nothing is in stock right now.\nHere is a sample so you can see the look:")
@@ -1069,6 +1114,327 @@ def send_test_alerts(items):
         send_alert(group, test=True)
     if len(groups) > MAX_ALERTS_PER_DROP:
         send_text(f"🧪 +{len(groups) - MAX_ALERTS_PER_DROP} more deck(s) in stock, not shown.")
+
+
+# ============================================================
+# DROP BOARD
+# The first alert of a drop is one message listing every deck in stock, with a button per size.
+# While the drop goes on it is edited in place (sizes selling out, how fast), which makes no noise.
+# When something NEW lands, the board is sent again, so you get a fresh ping, and the old one is deleted:
+# there is always exactly one message. When everything has sold out it turns into the drop report.
+# ============================================================
+
+BOARD_WINDOW = 1800           # a board follows a drop for 30 minutes after the last new arrival
+BOARD_MAX_DECKS = 4
+BOARD = {"msg": None, "decks": {}, "t0": 0.0, "last_new": 0.0, "sig": "", "done": False, "image": ""}
+
+
+def board_on():
+    return switch_on("board")
+
+
+def board_reset():
+    BOARD.update(msg=None, decks={}, t0=0.0, last_new=0.0, sig="", done=False, image="")
+
+
+def board_save():
+    """Keeps the board in memory on disk, so a restart in the middle of a drop carries on editing it."""
+    META["board_state"] = {k: BOARD[k] for k in ("msg", "decks", "t0", "last_new", "done", "image")}
+    save_meta()
+
+
+def board_load():
+    saved = META.get("board_state")
+    if isinstance(saved, dict) and isinstance(saved.get("decks"), dict):
+        BOARD.update({k: saved[k] for k in ("msg", "decks", "t0", "last_new", "done", "image") if k in saved})
+
+
+def board_label(entry):
+    return f"{entry['shape']} · {entry['size']}" if entry.get("size") else entry["shape"]
+
+
+def board_items(deck, live):
+    return [e for e in deck["items"].values() if (e["gone"] is None) == live]
+
+
+def board_text(final=False, board=None, test=False):
+    board = BOARD if board is None else board
+    decks = list(board["decks"].values())
+    live_now = sum(len(board_items(d, True)) for d in decks)
+    gone_times = [e["gone"] for d in decks for e in d["items"].values() if e["gone"] is not None]
+    if test:
+        head = "🧪 <h>TEST</h> · this is how a drop looks"
+    else:
+        head = "🏁 <h>DROP OVER</h>" if final else f"⚡ <h>DROP</h> · {live_now} in stock"
+    lines = [head, LINE]
+    for deck in decks[:BOARD_MAX_DECKS]:
+        live, gone = board_items(deck, True), board_items(deck, False)
+        prices = {money(e["price"]) for e in deck["items"].values() if money(e["price"])}
+        lines.append(("🟢 " if live else "⚫ ") + f"<b>{esc(deck['product'])}</b>"
+                     + (f" · {next(iter(prices))}" if len(prices) == 1 else ""))
+        for e in live:
+            lines.append(f"      ⚡ {esc(board_label(e))}" + (f" · {money(e['price'])}" if len(prices) > 1 else ""))
+        for e in gone:
+            lines.append(f"      ⚫ {esc(board_label(e))} · gone in {human(e['gone'])}")
+    if len(decks) > BOARD_MAX_DECKS:
+        lines.append(f"➕ {len(decks) - BOARD_MAX_DECKS} more deck(s): see the shop")
+    lines.append(LINE)
+    if final:
+        lines.append(heat_label(min(gone_times) if gone_times else None))
+    else:
+        usual = [x for x in (typical_gone(e["shape"]) for d in decks for e in board_items(d, True)) if x]
+        if usual:
+            lines.append(f"⏱ usually gone in ~{human(min(usual))}")
+    if test:
+        lines.append("⚡ <i>A sample. Nothing just restocked.</i>")
+    else:
+        lines.append(f"🕒 {local_time(board['t0']).strftime('%H:%M:%S')} · updated {local_time(time.time()).strftime('%H:%M:%S')}")
+    text = "\n".join(lines)
+    if len(text) > 1000:                                    # a photo caption holds 1024 characters
+        text = "\n".join(l for l in lines if "gone in" not in l)[:1000]
+    return text
+
+
+def board_markup(final=False, board=None, test=False):
+    board = BOARD if board is None else board
+    if final:
+        return {"inline_keyboard": [[{"text": btn("🔗 Open shop"), "url": SITE}]]}
+    decks = [d for d in list(board["decks"].values())[:BOARD_MAX_DECKS] if board_items(d, True)]
+    rows = []
+    for deck in decks:
+        if len(decks) > 1:
+            rows.append([{"text": btn(f"🔗 {deck['product'][:30]}"), "url": deck["product_url"]}])
+        buttons = [{"text": btn(f"⚡ {board_label(e)}"), "url": e["cart_url"]} for e in board_items(deck, True)]
+        rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if not decks:
+        return {"inline_keyboard": [[{"text": btn("🔗 Open shop"), "url": SITE}]]}
+    ids = [vid for d in decks for vid, e in d["items"].items() if e["gone"] is None]
+    while len("b:" + ",".join(ids)) > 64 and len(ids) > 1:
+        ids.pop()
+    rows.append([{"text": btn("🛒 Cart page"), "url": decks[0]["cart_page_url"]},
+                 {"text": btn("✅ I bought it"), "callback_data": "b:test" if test else "b:" + ",".join(ids)}])
+    return {"inline_keyboard": rows}
+
+
+def board_preview(items):
+    """/test with the board on: one sample board for the decks in stock (or a sample deck). Nothing is remembered."""
+    now = time.time()
+    sample = {"decks": {}, "t0": now}
+    for it in items:
+        deck = sample["decks"].setdefault(it["handle"], {
+            "product": it["product"], "product_url": it["product_url"], "cart_page_url": it["cart_page_url"],
+            "items": {}})
+        deck["items"][it["id"]] = {"shape": it["shape"], "size": it["size"], "price": it["price"],
+                                   "cart_url": it["cart_url"], "t": now, "gone": None}
+    text = board_text(board=sample, test=True)
+    markup = board_markup(board=sample, test=True)
+    image = next((it.get("image") for it in items if it.get("image")), "")
+
+    def attempt():
+        if image:
+            result = send_photo(image, text, markup)
+            if result.get("ok"):
+                return result
+        return send_text(text, markup)
+
+    return deliver(attempt)
+
+
+def board_post():
+    """Sends the board as a new message (photo of the newest deck, or text). True if Telegram accepted it."""
+    text, markup, image = board_text(), board_markup(), BOARD["image"]
+    sent = {}
+
+    def attempt():
+        if image:
+            result = send_photo(image, text, markup)
+            if result.get("ok"):
+                sent.update(kind="photo", result=result)
+                return result
+        result = send_text(text, markup)
+        if result.get("ok"):
+            sent.update(kind="text", result=result)
+        return result
+
+    if not deliver(attempt):
+        return False
+    result = sent["result"].get("result")
+    BOARD["msg"] = {"id": result.get("message_id") if isinstance(result, dict) else None, "kind": sent["kind"]}
+    BOARD["sig"] = text + json.dumps(markup, sort_keys=True)
+    board_save()
+    return True
+
+
+def board_edit(final=False):
+    """Updates the board in place: no new message, no notification."""
+    msg = BOARD["msg"]
+    if not msg or not msg.get("id"):
+        return
+    text, markup = board_text(final), board_markup(final)
+    sig = text + json.dumps(markup, sort_keys=True)
+    if sig == BOARD["sig"]:
+        return
+    params = {"chat_id": TELEGRAM_CHAT_ID, "message_id": msg["id"], "parse_mode": "HTML",
+              "reply_markup": json.dumps(markup)}
+    if msg["kind"] == "photo":
+        method, params["caption"] = "editMessageCaption", render(text)
+    else:
+        method, params["text"], params["disable_web_page_preview"] = "editMessageText", render(text), "true"
+    result = telegram_api(method, params)
+    if result.get("ok") or "not modified" in str(result.get("description", "")):
+        BOARD["sig"] = sig
+        board_save()
+    else:
+        log("The drop board could not be edited, sending it again")
+        board_post()
+
+
+def board_finish():
+    BOARD["done"] = True
+    board_edit(final=True)
+
+
+def board_arrive(items):
+    """New stock: adds it to the board and sends the board again (a fresh ping). Returns the ids it covered."""
+    now = time.time()
+    if BOARD["msg"] and not BOARD["done"] and now - BOARD["last_new"] > BOARD_WINDOW:
+        board_finish()                                       # an old drop: close it, start a new board
+    if BOARD["done"] or not BOARD["decks"]:
+        board_reset()
+    old = dict(BOARD["msg"]) if BOARD["msg"] else None
+    for it in items:
+        deck = BOARD["decks"].setdefault(it["handle"], {
+            "product": it["product"], "image": it.get("image", ""), "product_url": it["product_url"],
+            "cart_page_url": it["cart_page_url"], "items": {}})
+        deck["items"][it["id"]] = {"shape": it["shape"], "size": it["size"], "price": it["price"],
+                                   "cart_url": it["cart_url"], "t": now, "gone": None}
+    BOARD["image"] = next((it.get("image") for it in items if it.get("image")), BOARD["image"])
+    BOARD["t0"] = BOARD["t0"] or now
+    BOARD["last_new"] = now
+    log("DROP BOARD: " + ", ".join(f"{d['product']} ({len(d['items'])})" for d in BOARD["decks"].values()))
+    if not board_post():
+        return set()
+    if old and old.get("id"):
+        telegram_api("deleteMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": old["id"]})
+    return {it["id"] for it in items}
+
+
+def board_tick(snapshot):
+    """After every check: sizes that sold out are noted, and the board is edited in place or closed."""
+    if not BOARD["msg"] or BOARD["done"]:
+        return
+    now = time.time()
+    changed = False
+    for deck in BOARD["decks"].values():
+        for vid, entry in deck["items"].items():
+            if entry["gone"] is None and not snapshot.get(vid, {}).get("available"):
+                entry["gone"] = round(now - entry["t"], 1)
+                changed = True
+    everything_gone = not any(board_items(d, True) for d in BOARD["decks"].values())
+    if everything_gone or now - BOARD["last_new"] > BOARD_WINDOW:
+        board_finish()
+    elif changed:
+        board_edit()
+
+
+# ============================================================
+# SHOP NEWS
+# A new product, a new size, a price change, all in ONE message.
+# Early warning: a deck is usually listed (sold out) before it drops.
+# The first read after a fresh start only learns what is there, it never alerts.
+# ============================================================
+
+NEWS_LIMIT = 6
+
+
+def news_on():
+    return switch_on("news")
+
+
+def detect_news(products, snapshot, alerted_ids):
+    """Compares the shop with what was seen last time. Sends one message if anything is new."""
+    seen = META.get("seen") or {}
+    prices = META.get("prices") or {}
+    baseline = not seen
+    new_seen, new_prices, entries = {}, dict(prices), []
+
+    for product in products:
+        handle = product.get("handle") or product.get("title", "")
+        title = product.get("title", "Unknown Product")
+        variants = [v for v in product.get("variants", []) if v.get("id") is not None]
+        vids = [str(v["id"]) for v in variants]
+        new_seen[handle] = vids
+        if baseline or any(vid in alerted_ids for vid in vids):      # a drop alert already covers it
+            continue
+        images = product.get("images") or []
+        image = images[0].get("src", "") if images else ""
+        url = f"{SITE}/products/{handle}" if handle else SITE
+        if handle not in seen:
+            cheapest = min((float(v.get("price") or 0) for v in variants), default=0) or ""
+            entries.append({"kind": "product", "title": title, "image": image, "url": url,
+                            "price": cheapest, "variants": [
+                                (v.get("title", ""), bool(v.get("available"))) for v in variants]})
+        else:
+            for v in variants:
+                if str(v["id"]) not in seen[handle]:
+                    entries.append({"kind": "size", "title": title, "image": image, "url": url,
+                                    "variant": v.get("title", ""), "available": bool(v.get("available")),
+                                    "price": v.get("price", "")})
+    for vid, it in snapshot.items():
+        old, now = prices.get(vid), it.get("price", "")
+        new_prices[vid] = now
+        try:
+            changed = old is not None and abs(float(old) - float(now)) > 0.004
+        except (TypeError, ValueError):
+            changed = False
+        if changed and not baseline and vid not in alerted_ids:
+            entries.append({"kind": "price", "title": it["product"], "image": it.get("image", ""),
+                            "url": it["product_url"], "variant": it["shape"], "old": old, "new": now})
+
+    if entries and news_on():
+        if not send_news(entries):
+            return                                  # not delivered: nothing is marked as seen, so it tries again
+    META["seen"], META["prices"] = new_seen, new_prices
+    save_meta()
+
+
+def news_lines(entries):
+    lines = []
+    for e in entries[:NEWS_LIMIT]:
+        if e["kind"] == "product":
+            price = money(e["price"])
+            lines.append(f"🆕 <b>{esc(e['title'])}</b>" + (f" · {price}" if price else ""))
+            sizes = ", ".join(f"{esc(v)}{'' if ok else ' (sold out)'}" for v, ok in e["variants"][:5])
+            if sizes:
+                lines.append(f"      {sizes}")
+        elif e["kind"] == "size":
+            lines.append(f"➕ <b>{esc(e['title'])}</b> · new size {esc(e['variant'])}"
+                         + ("" if e["available"] else " (sold out)"))
+        else:
+            lines.append(f"💲 <b>{esc(e['title'])}</b> {esc(e['variant'])}: {money(e['old'])} → {money(e['new'])}")
+    if len(entries) > NEWS_LIMIT:
+        lines.append(f"➕ {len(entries) - NEWS_LIMIT} more: see the shop")
+    return lines
+
+
+def send_news(entries):
+    """One message for everything new. True once Telegram accepted it."""
+    caption = "\n".join(["🆕 <h>SHOP UPDATE</h>", LINE] + news_lines(entries) + [LINE,
+                         "👀 <i>Not in stock yet? Be ready.</i>" if any(
+                             e["kind"] != "price" for e in entries) else "💲 <i>Prices changed.</i>"])
+    first = entries[0]
+    markup = {"inline_keyboard": [[{"text": btn("🔗 Open page"), "url": first["url"]},
+                                   {"text": btn("🛒 Open shop"), "url": SITE}]]}
+    log("SHOP NEWS: " + "; ".join(f"{e['kind']} {e['title']}" for e in entries[:NEWS_LIMIT]))
+
+    def attempt():
+        if first.get("image"):
+            result = send_photo(first["image"], caption[:1000], markup)
+            if result.get("ok"):
+                return result
+        return send_text(caption, markup)
+
+    return deliver(attempt)
 
 
 def remember_drop(items):
@@ -1227,7 +1593,8 @@ def maybe_drop_reports():
         if everything_gone or now - event["t"] > REPORT_AFTER:
             event["reported"] = True
             save_meta()
-            send_text(report_text(event))
+            if not board_on():                  # with the board on, the board itself turns into the report
+                send_text(report_text(event))
 
 
 def history_text():
@@ -1330,7 +1697,8 @@ def handle_smart(argument):
 
 
 # ============================================================
-# LIVE RADAR: a page that opens inside Telegram
+# LIVE RADAR
+# A page that opens inside Telegram.
 # Four sizes, big BUY buttons, drop mode, your pickups and parcels, a sweeping
 # radar. It reads the radar's own memory every 2 seconds, so it never adds
 # a single request to the shop. Only YOUR Telegram can open it: the page checks
@@ -2107,7 +2475,8 @@ def handle_radar():
 
 
 # ============================================================
-# ALARM: wake me up when a drop lands, but only while I'm asleep
+# ALARM
+# Wakes you when a drop lands, but only while you are asleep.
 # One loud Bark alert (it ignores Silent and Focus, and loops its sound for 30 seconds). Tap it and it
 # stops the alarm and opens the checkout in one go. It repeats every 30 seconds until you tap it.
 # It stays quiet while you are active: no alarm for 30 minutes after you last used the bot or the
@@ -2141,8 +2510,6 @@ def alarm_settings():
     if not isinstance(settings, dict):
         settings = {"on": False, "hours": NIGHT_HOURS}
         META["alarm"] = settings
-    elif settings == {"on": False, "hours": ""}:          # the old default: start with the night hours
-        settings["hours"] = NIGHT_HOURS
     return settings
 
 
@@ -2225,9 +2592,10 @@ def alarm_gone(ids):
     return not any(snapshot.get(i, {}).get("available") for i in ids)
 
 
-def ack_alarm():
-    ALARM["acked"] = True
-    return "Alarm off ✓"
+def alarm_shapes():
+    """The sizes allowed to wake you. Watched decks always can."""
+    chosen = alarm_settings().get("shapes")
+    return [x for x in SHAPES if x in chosen] if isinstance(chosen, list) and chosen else list(SHAPES)
 
 
 def awake_link(token):
@@ -2306,6 +2674,8 @@ def alarm_run(items, test=False):
             send_text("⏹ <h>Alarm stopped</h>\n" + LINE
                       + f"\nNo tap for {human(time.time() - started)}, so I stopped as a safety. "
                         "Check the alarm in /panel.")
+    except Exception as e:
+        log(f"Alarm problem: {e}")
     finally:
         ALARM["running"] = False
 
@@ -2316,6 +2686,10 @@ def ring_alarm(items, test=False):
     if not test:
         if not (alarm_active() and BARK_KEY):
             return
+        allowed = alarm_shapes()
+        items = [it for it in items if it.get("watch") or it["shape"] in allowed]
+        if not items:
+            return                                  # only sizes you did not choose: the normal alert is enough
         if ALARM["running"]:
             ALARM.update(ids=[it["id"] for it in items], headline=alarm_headline(items), buy=items[0]["cart_url"])
             return
@@ -2368,6 +2742,7 @@ def alarm_text():
     elif not public_url():
         lines.append("⚠️ No web address yet: the alert can't tell it was tapped (see /radar)")
     lines += [
+        "🎯 Sizes: " + (" · ".join(alarm_shapes()) if len(alarm_shapes()) < len(SHAPES) else "all"),
         f"😴 Rings only if you haven't used the bot for {ALARM_AWAKE_MINUTES:g} min",
         LINE,
         "One loud alert. Tap it: it stops, and the checkout opens.",
@@ -2381,6 +2756,8 @@ def alarm_markup():
     return {"inline_keyboard": [
         [{"text": btn(f"📲 Alarm: {'Off' if mode == 'off' else 'On'}"), "callback_data": "al:toggle"}],
         [{"text": btn(f"🌙 Only 23:00-09:00: {'On' if night_only else 'Off'}"), "callback_data": "al:hours"}],
+        [{"text": btn(("✅ " if shape in alarm_shapes() else "⬜ ") + shape), "callback_data": f"al:s:{shape}"}
+         for shape in SHAPES],
         [{"text": btn("🧪 Test"), "callback_data": "al:test"},
          {"text": btn("◀ Panel"), "callback_data": "pn:home"}],
     ]}
@@ -2403,32 +2780,22 @@ def handle_alarm_tap(query, data):
     key = data[3:]
     settings = alarm_settings()
     if key == "toggle":
-        changed, toast = switch_alarm(settings, not settings.get("on"))
+        _, toast = switch_alarm(settings, not settings.get("on"))
     elif key == "hours":
         settings["hours"] = "" if settings.get("hours") else NIGHT_HOURS
         toast = "Rings only 23:00 to 09:00 🌙" if settings["hours"] else "Rings at any hour"
-    elif key == "night":                                # older buttons still in the chat
-        _, toast = switch_alarm(settings, True)
-        settings["hours"] = NIGHT_HOURS
-    elif key == "always":
-        _, toast = switch_alarm(settings, True)
-        settings["hours"] = ""
-    elif key == "on":
-        _, toast = switch_alarm(settings, True)
-    elif key == "off":
-        _, toast = switch_alarm(settings, False)
-    elif key.startswith("h:"):
-        value = key[2:]
-        try:
-            parse_hours(value)
-        except Exception:
+    elif key.startswith("s:"):
+        shape, chosen = key[2:], alarm_shapes()
+        if shape not in SHAPES:
             return "✓"
-        settings["hours"], toast = ("" if value == "all" else value), "Hours set"
-    elif key in ("test", "bark"):
+        if shape in chosen and len(chosen) == 1:
+            return "Keep at least one size"
+        chosen = [x for x in chosen if x != shape] if shape in chosen else chosen + [shape]
+        settings["shapes"] = [x for x in SHAPES if x in chosen]
+        toast = f"{shape} {'can' if shape in chosen else 'will not'} wake you"
+    elif key == "test":
         ring_alarm(test_alarm_items(), test=True)
         toast = "Test alert sent 📲" if BARK_KEY else "Set up Bark first (BARK_KEY)"
-    elif key == "ack":
-        return ack_alarm()
     else:
         return "✓"
     save_meta()
@@ -2437,21 +2804,16 @@ def handle_alarm_tap(query, data):
 
 
 def handle_alarm(argument):
-    """/alarm shows the buttons. Typing still works: /alarm on, /alarm off, /alarm night, /alarm hours 23-9, /alarm test."""
+    """/alarm shows the buttons. Typing works too: /alarm on, /alarm off, /alarm hours 23-9 (or all), /alarm test."""
     parts = argument.strip().lower().split()
     settings = alarm_settings()
     if parts and parts[0] in ("on", "off"):
-        changed, toast = switch_alarm(settings, parts[0] == "on")
+        changed, _ = switch_alarm(settings, parts[0] == "on")
         if not changed:
             send_text("📲 <h>Bark not set up</h>\n" + LINE + "\nInstall Bark, copy its key, add <b>BARK_KEY</b> in Railway "
                       "Variables and deploy. Then switch the alarm on here.", alarm_markup())
             return
         save_meta()
-    elif parts and parts[0] == "night":
-        changed, toast = switch_alarm(settings, True)
-        if changed:
-            settings["hours"] = NIGHT_HOURS
-            save_meta()
     elif parts and parts[0] == "hours" and len(parts) >= 2:
         try:
             parse_hours(parts[1])
@@ -2460,7 +2822,7 @@ def handle_alarm(argument):
             return
         settings["hours"] = "" if parts[1] in ("all", "always") else parts[1]
         save_meta()
-    elif parts and parts[0] in ("test", "bark"):
+    elif parts and parts[0] == "test":
         if not BARK_KEY:
             send_text("📲 <h>Bark not set up</h>\n" + LINE + "\nInstall Bark, copy its key, add <b>BARK_KEY</b> in Railway "
                       "Variables and deploy.")
@@ -2474,15 +2836,15 @@ def handle_alarm(argument):
 
 
 # ============================================================
-# CONTROL PANEL: everything on buttons
+# CONTROL PANEL
+# Everything on buttons.
 # ============================================================
 
 def smart_on():
-    return bool(META.get("smart", True))
+    return switch_on("smart")
 
 
 def panel_text():
-    settings = alarm_settings()
     fast = fast_now()
     return "\n".join([
         "🎛 <h>Control panel</h>",
@@ -2508,6 +2870,8 @@ def panel_markup():
          {"text": btn("⚙ Alarm settings"), "callback_data": "pn:alarmset"}],
         [{"text": state("⚡ Auto drop", auto_drop_on()), "callback_data": "pn:auto"},
          {"text": btn("👀 Watching"), "callback_data": "pn:watch"}],
+        [{"text": state("🧾 One message", board_on()), "callback_data": "pn:board"},
+         {"text": state("🆕 New products", news_on()), "callback_data": "pn:news"}],
         [{"text": btn("🏆 Pickups"), "callback_data": "pn:stats"},
          {"text": btn("📦 Parcels"), "callback_data": "pn:parcels"}],
         [{"text": btn("📜 History"), "callback_data": "pn:history"},
@@ -2535,14 +2899,8 @@ def handle_panel_tap(query, data):
         changed, toast = switch_alarm(settings, not settings.get("on"))
         if changed:
             save_meta()
-    elif key == "smart":
-        META["smart"] = not smart_on()
-        save_meta()
-        toast = "Smart drop on" if META["smart"] else "Smart drop off"
-    elif key == "auto":
-        META["auto_drop"] = not auto_drop_on()
-        save_meta()
-        toast = "Auto drop on" if META["auto_drop"] else "Auto drop off"
+    elif key in ("smart", "auto", "board", "news"):
+        toast = flip_switch("autodrop" if key == "auto" else key)
     elif key == "alarmset":
         edit_message(query, alarm_text(), alarm_markup())
         return "Alarm settings"
@@ -2755,7 +3113,8 @@ def handle_undo(confirmed=False):
 
 
 # ============================================================
-# PARCELS: from the shop to your home
+# PARCELS
+# From the shop to your home.
 # The shop's shipping email has a tracking number. Send it with
 # /track NUMBER and the radar follows the parcel for you. Live
 # updates come from USPS and Parcels App (keys in Railway).
@@ -3241,7 +3600,8 @@ def tracking_loop():
 
 
 # ============================================================
-# /status, /help and the daily message
+# STATUS AND HELP
+# /status, /help and the daily message.
 # ============================================================
 
 def ago(seconds):
@@ -3366,6 +3726,7 @@ def help_text():
         "\n"
         "<h>More</h>\n"
         "/password WORD · /test · /info · /help\n"
+        "/board · /news (on or off)\n"
         f"{LINE}\n"
         f"🟢 online · {mode_line()}\n"
         f"💱 prices ≈ S$ (1 USD = {FX['rate']:.2f})"
@@ -3394,7 +3755,7 @@ def maybe_daily_ping():
 
 
 # ============================================================
-# THE STOCK CHECK
+# STOCK CHECK
 # Raises FetchError on any problem, so the snapshot and the memory
 # are never replaced by half-read data. A deck is only marked "seen"
 # once Telegram has accepted its alert, so an alert can't be lost.
@@ -3431,7 +3792,8 @@ def check_stock():
     global CURRENT_SNAPSHOT, LAST_CHECK, SHOP_LOCKED, _last_available, _quiet_checks
 
     started = time.time()
-    snapshot = build_snapshot(fetch_products())
+    products = fetch_products()
+    snapshot = build_snapshot(products)
     took = time.time() - started
     if not snapshot:
         raise FetchError("no tracked shapes in the feed")
@@ -3463,6 +3825,10 @@ def check_stock():
             save_state()
     if sold_out:
         note_sold_out(sold_out)
+    try:
+        board_tick(snapshot)
+    except Exception as e:
+        log(f"Drop board update failed: {e}")
     if changed and not fresh_memory:
         touch_activity()                               # stock moved: keep drop mode going
 
@@ -3509,6 +3875,10 @@ def check_stock():
         missed = len(pending - delivered)
         if missed:
             log(f"{missed} alert(s) could not be delivered. Retrying on the next check.")
+    try:
+        detect_news(products, snapshot, {it["id"] for it in wanted})
+    except Exception as e:
+        log(f"Shop news check failed: {e}")
 
     # quiet by default: only when something changes, or every LOG_EVERY checks
     _quiet_checks += 1
@@ -3532,7 +3902,7 @@ def run_test_once():
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# COMMANDS
 # ============================================================
 
 def drop_stale_updates():
@@ -3685,21 +4055,43 @@ def handle_unwatch(argument):
     send_text(f"👀 Stopped watching <b>{esc(found)}</b>.")
 
 
-def handle_autodrop(argument):
-    """/autodrop shows it. /autodrop on or /autodrop off changes it."""
+# The simple on/off settings: /autodrop, /board, /news, and the matching buttons in /panel.
+SWITCHES = {
+    "autodrop": ("auto_drop", "⚡ Auto drop",
+                 "When something is in stock, I switch to fast checking by myself and stay fast while it lasts."),
+    "board": ("board", "🧾 One message",
+              "A drop is one tidy message that updates by itself. Off: one alert per deck."),
+    "news": ("news", "🆕 New products",
+             "One message when the shop lists a new product, adds a size or changes a price."),
+    "smart": ("smart", "🔮 Smart drop",
+              "Drop mode switches on by itself 10 minutes before the times your shop usually drops."),
+}
+
+
+def switch_on(name):
+    return bool(META.get(SWITCHES[name][0], True))
+
+
+def flip_switch(name, on=None):
+    """Sets (or flips) a switch, saves it, and returns the little pop-up text."""
+    key, label, _ = SWITCHES[name]
+    META[key] = (not switch_on(name)) if on is None else bool(on)
+    save_meta()
+    return f"{label}: {'on' if META[key] else 'off'}"
+
+
+def handle_switch(name, argument):
+    """/autodrop, /board or /news on its own shows the setting. Add on or off to change it."""
     arg = argument.strip().lower()
     if arg in ("on", "off"):
-        META["auto_drop"] = arg == "on"
-        save_meta()
+        flip_switch(name, arg == "on")
     elif arg:
-        send_text("🤔 Try <b>/autodrop on</b> or <b>/autodrop off</b>, or use the button in /panel.")
+        send_text(f"🤔 Try <b>/{name} on</b> or <b>/{name} off</b>, or use the button in /panel.")
         return
-    state = "on" if auto_drop_on() else "off"
-    send_text(
-        f"⚡ <h>Auto drop</h>\n{LINE}\nIt is <b>{state}</b>.\n"
-        "When something is in stock, I switch to fast checking by myself and stay fast while it lasts.\n"
-        "<b>/autodrop on</b> or <b>/autodrop off</b>."
-    )
+    _, label, explain = SWITCHES[name]
+    send_text(f"{label.split(' ', 1)[0]} <h>{label.split(' ', 1)[1]}</h>\n{LINE}\n"
+              f"It is <b>{'on' if switch_on(name) else 'off'}</b>.\n{explain}\n"
+              f"<b>/{name} on</b> or <b>/{name} off</b>.")
 
 
 def handle_command(command):
@@ -3747,8 +4139,6 @@ def handle_callback(query):
         toast = f"{data[3:]} is sold out right now."
     elif data.startswith(("b:", "c:")):
         toast = handle_bought_tap(data)
-    elif data == "al:ack":
-        toast = ack_alarm()
     elif data.startswith("al:"):
         toast = handle_alarm_tap(query, data)
     elif data.startswith("pn:"):
@@ -3814,9 +4204,9 @@ def telegram_listener(offset):
                     continue
                 command = text.split()[0].lower().split("@")[0]
                 log(f"Command received: {command}")
-                if command == "/autodrop":
+                if command in ("/board", "/news", "/autodrop"):
                     parts = text.split(None, 1)
-                    handle_autodrop(parts[1] if len(parts) > 1 else "")
+                    handle_switch(command[1:], parts[1] if len(parts) > 1 else "")
                     continue
                 if command == "/alarm":
                     parts = text.split(None, 1)
@@ -3929,6 +4319,7 @@ def main():
     DROP["sticky"] = bool(META.get("drop_sticky"))
     _FAST["was"] = fast_now()
     load_pace_state()
+    board_load()
     refresh_fx()
     setup_telegram()
     offset = drop_stale_updates()
