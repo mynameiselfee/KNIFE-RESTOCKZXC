@@ -31,7 +31,9 @@ Railway variables (only the first two are required)
   Alarm
     BARK_KEY              the Bark app's key: the loud alarm that breaks through Silent (see /alarm)
     ALARM_AWAKE_MINUTES   no alarm for this long after you last used the bot or the radar (default 30)
-    ALARM_RINGS           at most this many loud alerts per drop, one a minute (default 4)
+    ALARM_RINGS           at most this many loud alerts per drop, one a minute (default 4, 1 = just one)
+    BARK_SOUND            the alert's sound, by its name in the Bark app's sound list (default alarm)
+    BARK_LOOP             1 = the sound repeats for 30 seconds (default), 0 = it plays once
   Parcels
     PARCELS_API_KEY       Parcels App key (parcelsapp.com)
     USPS_CLIENT_ID / USPS_CLIENT_SECRET   free USPS keys (optional)
@@ -89,7 +91,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "6.2 (21 Oct 2026)"
+VERSION = "6.3 (21 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -2593,6 +2595,8 @@ def handle_radar():
 
 BARK_KEY = os.getenv("BARK_KEY", "").strip()
 BARK_SERVER = os.getenv("BARK_SERVER", "https://api.day.app").rstrip("/")
+BARK_SOUND = (os.getenv("BARK_SOUND", "alarm").strip() or "alarm").removesuffix(".caf")
+BARK_LOOP = os.getenv("BARK_LOOP", "1").strip() != "0"
 BARK_EVERY = 60                    # seconds between Bark alerts (one alert loops its sound for 30 s, then a pause)
 ALARM_RINGS = max(1, int(float(os.getenv("ALARM_RINGS", "4"))))                # at most this many alerts per drop
 ALARM_AWAKE_MINUTES = max(1.0, float(os.getenv("ALARM_AWAKE_MINUTES", "30")))  # quiet this long after you were active
@@ -2660,7 +2664,9 @@ def bark_push(title, body, url=""):
     if not BARK_KEY:
         return ""
     payload = {"device_key": BARK_KEY, "title": title[:100], "body": body[:300], "level": "critical",
-               "volume": 10, "call": "1", "sound": "alarm", "group": "knife-radar"}
+               "volume": 10, "sound": BARK_SOUND, "group": "knife-radar"}
+    if BARK_LOOP:
+        payload["call"] = "1"
     if url:
         payload["url"] = url
     request = urllib.request.Request(
