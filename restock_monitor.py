@@ -46,6 +46,7 @@ Railway variables (only the first two are required)
     DAILY_PING_HOUR       0-23: one "still watching" message a day (off by default)
     TZ_OFFSET_HOURS       your hours from UTC (default 8, Singapore)
     FONT_STYLE            lettering for headings: plain (default), smallcaps, sans, serif, mono, ...
+                          (easier: send /fonts and tap one; that choice wins over this variable)
     BUTTON_STYLE          lettering for buttons (empty = same as FONT_STYLE)
     LOG_EVERY             1 = log every check (default 60)
   Live radar page
@@ -91,7 +92,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "6.3 (21 Oct 2026)"
+VERSION = "6.6 (28 Oct 2026)"
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -113,8 +114,10 @@ SEND_RETRY_WAITS = (0, 2, 4, 8, 12)   # seconds to wait before each send attempt
 
 # Telegram's own font can't be changed by a bot, but headings can use special lettering:
 #   BUTTON_STYLE = the same names, only for the buttons (empty = same as FONT_STYLE)
-#   FONT_STYLE = plain (default), sans, sanslight, sansitalic, serif, serifitalic, script,
-#                gothic, double, mono, wide, smallcaps (capitals stay big), smallcapsall or spaced
+#   FONT_STYLE = plain (default), sans, sanslight, sansitalic, sansbolditalic, serif, serifitalic,
+#                serifbolditalic, script, scriptlight, gothic, gothiclight, double, mono, wide, circled,
+#                circledblack, squared, tiny, smallcaps (capitals stay big), smallcapsall or spaced
+#   /fonts in Telegram shows them all and lets you pick with a tap.
 FONT_STYLE = os.getenv("FONT_STYLE", "plain").strip().lower()
 # Buttons can use their own lettering. Empty = same as FONT_STYLE.
 BUTTON_STYLE = os.getenv("BUTTON_STYLE", "").strip().lower()
@@ -155,13 +158,45 @@ _LETTERING = {
                {"C": "ℂ", "H": "ℍ", "N": "ℕ", "P": "ℙ", "Q": "ℚ", "R": "ℝ", "Z": "ℤ"}),
     "mono": (0x1D670, 0x1D68A, 0x1D7F6, {}),            # 𝙼𝚘𝚗𝚘 typewriter
     "wide": (0xFF21, 0xFF41, 0xFF10, {}),               # ｗｉｄｅ full-width
+    "sansbolditalic": (0x1D63C, 0x1D656, None, {}),     # 𝙎𝙖𝙣𝙨 bold italic
+    "serifbolditalic": (0x1D468, 0x1D482, None, {}),    # 𝑺𝒆𝒓𝒊𝒇 bold italic
+    "scriptlight": (0x1D49C, 0x1D4B6, None,              # 𝒮𝒸𝓇𝒾𝓅𝓉 thin script
+                    {"B": "ℬ", "E": "ℰ", "F": "ℱ", "H": "ℋ", "I": "ℐ", "L": "ℒ", "M": "ℳ", "R": "ℛ",
+                     "e": "ℯ", "g": "ℊ", "o": "ℴ"}),
+    "gothiclight": (0x1D504, 0x1D51E, None,              # 𝔊𝔬𝔱𝔥𝔦𝔠 thin fraktur
+                    {"C": "ℭ", "H": "ℌ", "I": "ℑ", "R": "ℜ", "Z": "ℨ"}),
+    "circled": (0x24B6, 0x24D0, None,                    # Ⓒⓘⓡⓒⓛⓔⓓ
+                dict({"0": "⓪"}, **{str(d): chr(0x2460 + d - 1) for d in range(1, 10)})),
+    "circledblack": (0x1F150, 0x1F150, None,             # 🅒🅘🅡🅒🅛🅔 (always capitals)
+                     dict({"0": "⓿"}, **{str(d): chr(0x2776 + d - 1) for d in range(1, 10)})),
+    "squared": (0x1F130, 0x1F130, None, {}),             # 🄱🄾🅇 (always capitals)
 }
+_TINY = dict(zip("abcdefghijklmnoprstuvwxyz0123456789", "ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ⁰¹²³⁴⁵⁶⁷⁸⁹"))
+FONT_NAMES = ["plain", "smallcaps", "smallcapsall", "sans", "sanslight", "sansitalic", "sansbolditalic",
+              "serif", "serifitalic", "serifbolditalic", "script", "scriptlight", "gothic", "gothiclight",
+              "double", "mono", "wide", "circled", "circledblack", "squared", "tiny", "spaced"]
+
+
+def font_style():
+    """The headings' lettering: your /fonts choice, or FONT_STYLE."""
+    chosen = META.get("font_style") if isinstance(META, dict) else None
+    return chosen if chosen in FONT_NAMES else FONT_STYLE
+
+
+def button_style():
+    """Buttons: plain if you chose that in /fonts, else BUTTON_STYLE, else the headings' lettering."""
+    chosen = META.get("button_style") if isinstance(META, dict) else None
+    if chosen in FONT_NAMES:
+        return chosen
+    return BUTTON_STYLE or font_style()
 
 
 def fancy(text, style=None):
     """Lettering from FONT_STYLE (or the style given). Only A-Z, a-z and 0-9 change."""
-    style = FONT_STYLE if style is None else style
+    style = font_style() if style is None else style
     text = str(text)
+    if style == "tiny":                                    # ᵗⁱⁿʸ (there is no small q)
+        return "".join(_TINY.get(ch.lower(), ch) for ch in text)
     if style == "smallcaps":                              # KNIFE MFG CO · ᴅᴇᴄᴋ ʀᴀᴅᴀʀ
         return "".join(_SMALL_CAPS.get(ch, ch) for ch in text)    # capitals stay capitals
     if style == "smallcapsall":                           # ᴋɴɪꜰᴇ ᴍꜰɢ ᴄᴏ · ᴅᴇᴄᴋ ʀᴀᴅᴀʀ
@@ -189,7 +224,7 @@ def fancy(text, style=None):
 
 def btn(text):
     """A button label in the button lettering (BUTTON_STYLE, or FONT_STYLE if not set)."""
-    return fancy(text, BUTTON_STYLE or FONT_STYLE)
+    return fancy(text, button_style())
 
 
 def render(text):
@@ -452,7 +487,7 @@ def auto_start_drop():
 def auto_drop_when_in_stock(snapshot):
     """While anything is in stock, keep checking fast. If it is still there after AUTO_DROP_MAX_MINUTES
     (a size that is simply always available) it relaxes again, so it never stays fast for days."""
-    if not any(it["available"] for it in snapshot.values()):
+    if not any(it["available"] and is_mine(it) for it in snapshot.values()):
         AUTO["since"] = 0.0
         return
     if not auto_drop_on():
@@ -1026,10 +1061,6 @@ def alert_buttons(group, test=False):
             buttons.append({"text": btn(f"✖ {label}"), "callback_data": f"so:{shape}"})
 
     first = next(iter(live.values())) if live else group[0]
-    ids = [it["id"] for it in group]
-    while len("b:" + ",".join(ids)) > 64 and len(ids) > 1:
-        ids.pop()
-    bought = {"text": btn("✅ I bought it"), "callback_data": "b:test" if test else "b:" + ",".join(ids)}
     rows = [buttons[0:2], buttons[2:4]] if any(it.get("watch") is not True for it in group) else []
     extra = [{"text": btn(f"⚡ {it['shape']}"), "url": it["cart_url"]}
              for it in group if it.get("watch")]
@@ -1037,7 +1068,6 @@ def alert_buttons(group, test=False):
     rows += [
         [{"text": btn("🔗 Open page"), "url": first["product_url"]},
          {"text": btn("🛒 Cart page"), "url": first["cart_page_url"]}],
-        [bought],
     ]
     return {"inline_keyboard": rows}
 
@@ -1063,6 +1093,16 @@ def send_alert(group, test=False):
 
 
 def send_alerts(items):
+    """Only your sizes (and decks you /watch) are shown. Other sizes are noted quietly, never shown,
+    so they never pop up later either. Returns the variant ids that are dealt with."""
+    quiet = {it["id"] for it in items if not is_mine(it)}
+    mine = [it for it in items if is_mine(it)]
+    if quiet:
+        log(f"Not your size, kept quiet: {len(quiet)} size(s)")
+    return (send_alerts_now(mine) if mine else set()) | quiet
+
+
+def send_alerts_now(items):
     """Sends the alerts and returns the variant ids Telegram accepted."""
     if board_on():
         try:
@@ -1142,7 +1182,7 @@ def sizes_text():
     return "\n".join([
         "🎯 <h>My sizes</h>", LINE,
         "Now: <b>" + (" · ".join(mine) if len(mine) < len(SHAPES) else "all four") + "</b>",
-        "Your sizes come first on every card, and only these can set off the alarm.",
+        "Only these show up: drop cards, pings and the alarm. Other sizes are ignored completely.",
     ])
 
 
@@ -1258,10 +1298,10 @@ def short_time(seconds):
 
 
 def card_live(card):
-    """The sizes still in stock on a card: your sizes first, then the others, in the usual order."""
+    """Your sizes still in stock on a card, in the usual order. Other sizes never show."""
     order = {s: i for i, s in enumerate(SHAPES)}
-    live = [(vid, e) for vid, e in card["items"].items() if e["gone"] is None]
-    return sorted(live, key=lambda x: (not is_mine(x[1]), order.get(x[1]["shape"], 99)))
+    live = [(vid, e) for vid, e in card["items"].items() if e["gone"] is None and is_mine(e)]
+    return sorted(live, key=lambda x: order.get(x[1]["shape"], 99))
 
 
 def card_text(card, test=False):
@@ -1286,11 +1326,7 @@ def card_markup(card, test=False):
     buttons = [{"text": btn(f"⚡ {e['shape']}" + (f" · {e['size']}" if e.get("size") else "")),
                 "url": e["cart_url"] if test else go_link(vid, e["cart_url"])} for vid, e in live]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    ids = [vid for vid, _ in live]
-    while len("b:" + ",".join(ids)) > 64 and len(ids) > 1:
-        ids.pop()
-    rows.append([{"text": btn("🛒 Cart page"), "url": card["cart_page_url"]},
-                 {"text": btn("✅ I bought it"), "callback_data": "b:test" if test else "b:" + ",".join(ids)}])
+    rows.append([{"text": btn("🛒 Cart page"), "url": card["cart_page_url"]}])
     return {"inline_keyboard": rows}
 
 
@@ -2989,7 +3025,8 @@ def panel_markup():
         [{"text": btn("📦 Parcels"), "callback_data": "pn:parcels"},
          {"text": btn("📜 History"), "callback_data": "pn:history"}],
         [{"text": btn("🔮 Forecast"), "callback_data": "pn:forecast"},
-         {"text": btn("❔ Help"), "callback_data": "pn:help"}],
+         {"text": btn("🔤 Fonts"), "callback_data": "pn:fonts"}],
+        [{"text": btn("❔ Help"), "callback_data": "pn:help"}],
     ]}
 
 
@@ -3044,6 +3081,9 @@ def handle_panel_tap(query, data):
     elif key == "help":
         send_text(help_text(), help_markup())
         return "Help ⬇"
+    elif key == "fonts":
+        edit_message(query, fonts_text(), fonts_markup())
+        return "Fonts"
     else:
         return "✓"
     edit_message(query, panel_text(), panel_markup())
@@ -3053,7 +3093,7 @@ def handle_panel_tap(query, data):
 # ============================================================
 # MY PICKUPS
 # The bot can't see your payment (it happens in the shop's own checkout),
-# so a pickup is counted when YOU tap "I bought it" or send /bought.
+# so a pickup is counted when YOU send /bought.
 # ============================================================
 
 CONGRATS = [
@@ -3115,7 +3155,7 @@ def stats_text():
     items = META.get("purchases") or []
     head = ["🏆 <h>KNIFE MFG CO · my pickups</h>", LINE]
     if not items:
-        return "\n".join(head + ["No pickups yet.", "Tap ✅ I bought it under an alert after you buy."])
+        return "\n".join(head + ["No pickups yet.", "After you buy, send /bought to count it."])
     tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     this_month = datetime.now(tz).strftime("%Y-%m")
     month = sum(1 for p in items if datetime.fromtimestamp(p["t"], tz).strftime("%Y-%m") == this_month)
@@ -3192,8 +3232,7 @@ def handle_bought_command(argument):
     last = events[-1] if events and time.time() - events[-1]["t"] < 7 * 86400 else None
     if not last:
         send_text(
-            "🛒 Tap <b>✅ I bought it</b> under an alert after you buy,\n"
-            "or send <b>/bought</b> and what you got, like <b>/bought All Over 2 KL1</b>."
+            "🛒 Send <b>/bought</b> and what you got, like <b>/bought All Over 2 KL1</b>."
         )
         return
     buttons = [
@@ -3838,7 +3877,7 @@ def help_text():
         "/parcels · /track NUMBER · /untrack NUMBER\n"
         "\n"
         "<h>More</h>\n"
-        "/password WORD · /test · /info · /help\n"
+        "/password WORD · /test · /info · /fonts · /help\n"
         "/board · /news (on or off)\n"
         f"{LINE}\n"
         f"🟢 online · {mode_line()}\n"
@@ -3980,11 +4019,13 @@ def check_stock():
                 STATE[vid] = True
             save_state()
         if delivered:
-            remember_drop([it for it in wanted if it["id"] in delivered])
-            record_restock([it for it in wanted if it["id"] in delivered])
-            auto_start_drop()                              # more usually follows a restock
+            mine = [it for it in wanted if it["id"] in delivered and is_mine(it)]
+            if mine:
+                remember_drop(mine)
+                record_restock(mine)
+                auto_start_drop()                          # more usually follows a restock
             if not fresh_memory:
-                ring_alarm([it for it in wanted if it["id"] in delivered])
+                ring_alarm(mine)
         missed = len(pending - delivered)
         if missed:
             log(f"{missed} alert(s) could not be delivered. Retrying on the next check.")
@@ -4113,7 +4154,7 @@ def info_text():
         f"memory {'saved' if MEMORY_OK else 'NOT saved (add a Volume at /data)'}",
         mode_line(),
         f"calm {CHECK_INTERVAL:g}s · drop {DROP_INTERVAL:g}s · extra {PACE['extra']:g}s",
-        f"fonts: headings {FONT_STYLE}, buttons {BUTTON_STYLE or FONT_STYLE}",
+        f"fonts: headings {font_style()}, buttons {button_style()}",
         f"watching {', '.join(SHAPES)}",
         "live radar page: " + (public_url() if LIVE_RADAR and public_url() else "needs a Railway domain (see /radar)"),
         f"shop requests: {REQ['sent']} · answered \"unchanged\": {REQ['unchanged']}",
@@ -4208,6 +4249,41 @@ def handle_switch(name, argument):
               f"<b>/{name} on</b> or <b>/{name} off</b>.")
 
 
+def fonts_text():
+    sample = "Knife Mfg Co 123"
+    lines = ["🔤 <h>Lettering</h>", LINE,
+             f"Headings: <b>{font_style()}</b> · buttons: <b>{button_style()}</b>", ""]
+    lines += [f"{'✅' if name == font_style() else '▫️'} {fancy(sample, name)}  <i>{name}</i>" for name in FONT_NAMES]
+    lines += [LINE, "Tap a style below. Telegram's own font can't change, so these are special letters."]
+    return "\n".join(lines)
+
+
+def fonts_markup():
+    buttons = [{"text": ("✅ " if name == font_style() else "") + fancy(name if name != "spaced" else "spaced", name),
+                "callback_data": f"ft:{name}"} for name in FONT_NAMES]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    plain_buttons = META.get("button_style") == "plain"
+    rows.append([{"text": "Buttons: plain" if plain_buttons else "Buttons: same as headings", "callback_data": "ft:buttons"}])
+    rows.append([{"text": btn("◀ Panel"), "callback_data": "pn:home"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_font_tap(query, data):
+    """A tap on /fonts: changes the lettering straight away (no restart needed)."""
+    key = data[3:]
+    if key == "buttons":
+        META["button_style"] = "" if META.get("button_style") == "plain" else "plain"
+        toast = "Buttons in plain letters" if META["button_style"] else "Buttons match the headings"
+    elif key in FONT_NAMES:
+        META["font_style"] = key
+        toast = f"Lettering: {key}"
+    else:
+        return "✓"
+    save_meta()
+    edit_message(query, fonts_text(), fonts_markup())
+    return toast
+
+
 def handle_command(command):
     if command == "/status":
         send_text(status_text(), status_markup())
@@ -4229,6 +4305,8 @@ def handle_command(command):
         handle_alarm("")
     elif command == "/sizes":
         handle_sizes("")
+    elif command == "/fonts":
+        send_text(fonts_text(), fonts_markup())
     elif command == "/panel":
         send_panel()
     elif command == "/history":
@@ -4259,6 +4337,8 @@ def handle_callback(query):
         toast = handle_alarm_tap(query, data)
     elif data.startswith("pn:"):
         toast = handle_panel_tap(query, data)
+    elif data.startswith("ft:"):
+        toast = handle_font_tap(query, data)
     elif data.startswith("sz:"):
         if data == "sz:open":
             edit_message(query, sizes_text(), sizes_markup())
@@ -4384,6 +4464,7 @@ MENU_COMMANDS = [
     ("panel", "Control panel with buttons"),
     ("status", "Stock right now"),
     ("sizes", "The sizes I buy"),
+    ("fonts", "Change the lettering"),
     ("alarm", "Loud alarm for drops while I sleep"),
     ("radar", "Open the live radar page"),
     ("drop", "Fast checking for a drop"),
