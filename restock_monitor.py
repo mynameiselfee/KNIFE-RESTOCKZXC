@@ -94,7 +94,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "6.8 (30 Oct 2026)"
+VERSION = "6.9 (30 Oct 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -3477,18 +3477,40 @@ def usps_link(number):
     return f"https://tools.usps.com/go/TrackConfirmAction?tLabels={urllib.parse.quote(number)}"
 
 
+def usps_reason(error):
+    """USPS's own words for a refusal, short and without anything secret (e.g. 'invalid_client')."""
+    try:
+        raw = error.read().decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    try:
+        data = json.loads(raw)
+        if isinstance(data.get("error"), dict):
+            data = data["error"]
+        bits = [str(data.get(k)) for k in ("error", "code", "error_description", "message") if data.get(k)]
+        text = " · ".join(bits) or raw
+    except Exception:
+        text = raw
+    text = re.sub(r"\s+", " ", text).strip()
+    for secret in (USPS_CLIENT_ID, USPS_CLIENT_SECRET):
+        if secret:
+            text = text.replace(secret, "…")
+    return text[:160]
+
+
 def usps_token(force=False):
-    """OAuth token for the USPS API, kept until it is about to expire."""
+    """OAuth token for the USPS API, kept until it is about to expire. Tries the 'tracking' scope,
+    then no scope at all (some new apps only accept that). Logs USPS's reason if it says no."""
     TRACK_HEALTH["service"] = "USPS"
     if not force and USPS_TOKEN["value"] and time.time() < USPS_TOKEN["until"] - 60:
         return USPS_TOKEN["value"]
-    fields = {"grant_type": "client_credentials", "client_id": USPS_CLIENT_ID,
-              "client_secret": USPS_CLIENT_SECRET, "scope": "tracking"}
+    base = {"grant_type": "client_credentials", "client_id": USPS_CLIENT_ID, "client_secret": USPS_CLIENT_SECRET}
     url = f"{USPS_BASE}/oauth2/v3/token"
-    attempts = [
-        ({"Content-Type": "application/json"}, json.dumps(fields).encode("utf-8")),
-        ({"Content-Type": "application/x-www-form-urlencoded"}, urllib.parse.urlencode(fields).encode("utf-8")),
-    ]
+    attempts = []
+    for fields in (dict(base, scope="tracking"), base):
+        attempts.append(({"Content-Type": "application/json"}, json.dumps(fields).encode("utf-8")))
+        attempts.append(({"Content-Type": "application/x-www-form-urlencoded"},
+                         urllib.parse.urlencode(fields).encode("utf-8")))
     last_error = None
     for headers, body in attempts:
         try:
@@ -3500,7 +3522,9 @@ def usps_token(force=False):
             return USPS_TOKEN["value"]
         except urllib.error.HTTPError as e:
             last_error = e
-            if e.code not in (400, 415):      # a wrong format gets a second try, anything else stops
+            reason = usps_reason(e)
+            log(f"USPS sign-in refused ({e.code}){': ' + reason if reason else ''}")
+            if e.code not in (400, 401, 415):     # these get the next format or scope, anything else stops
                 break
     raise last_error
 
@@ -3521,6 +3545,8 @@ def usps_call(number, retry=True):
         if e.code == 401 and retry:
             usps_token(force=True)
             return usps_call(number, retry=False)
+        reason = usps_reason(e)
+        log(f"USPS tracking refused ({e.code}){': ' + reason if reason else ''}")
         raise
 
 
