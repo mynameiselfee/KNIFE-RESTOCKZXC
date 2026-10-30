@@ -94,7 +94,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "6.9 (30 Oct 2026)"
+VERSION = "7.0 (30 Oct 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -3529,16 +3529,43 @@ def usps_token(force=False):
     raise last_error
 
 
+def usps_pick(data, number):
+    """Tracking 3.2 answers a list of requests. Finds the one for this number, in whatever shape it comes.
+    None if USPS has nothing for it yet."""
+    items = data
+    if isinstance(data, dict):
+        for key in ("trackingResults", "results", "items", "trackingInfo", "data"):
+            if isinstance(data.get(key), list):
+                items = data[key]
+                break
+        else:
+            items = [data]
+    if not isinstance(items, list) or not items:
+        return None
+    wanted = [i for i in items if isinstance(i, dict) and str(i.get("trackingNumber", "")).upper() == number.upper()]
+    item = (wanted or [i for i in items if isinstance(i, dict)] or [None])[0]
+    if not isinstance(item, dict):
+        return None
+    if item.get("error") and not (item.get("statusCategory") or item.get("trackingEvents")):
+        log(f"USPS has nothing for this number yet: {str(item.get('error'))[:120]}")
+        return None
+    return item
+
+
 def usps_call(number, retry=True):
-    """The raw USPS tracking reply, or None if USPS doesn't know the number yet (404)."""
+    """The USPS tracking reply for one number (Tracking 3.2: a POST with a list), or None if USPS
+    doesn't know the number yet. USPS asked everyone to move off the old 3.0 address."""
     TRACK_HEALTH["service"] = "USPS"
     request = urllib.request.Request(
-        f"{USPS_BASE}/tracking/v3/tracking/{urllib.parse.quote(number)}?expand=DETAIL",
-        headers={"Authorization": f"Bearer {usps_token()}", "Accept": "application/json"},
+        f"{USPS_BASE}/tracking/v3r2/tracking",
+        data=json.dumps([{"trackingNumber": number}]).encode("utf-8"),
+        headers={"Authorization": f"Bearer {usps_token()}", "Accept": "application/json",
+                 "Content-Type": "application/json"},
+        method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return usps_pick(json.loads(response.read().decode("utf-8") or "null"), number)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
