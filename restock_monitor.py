@@ -35,6 +35,8 @@ Railway variables (only the first two are required)
     BARK_SOUND            the alert's sound, by its name in the Bark app's sound list (default alarm)
     BARK_LOOP             1 = the sound repeats for 30 seconds (default), 0 = it plays once
   Parcels
+    PARCEL_AUTO           1 = check parcels by itself (needs keys that work from Railway). Default 0:
+                          /parcels lists your numbers with tap-to-track buttons
     PARCELS_API_KEY       Parcels App key (parcelsapp.com)
     USPS_CLIENT_ID / USPS_CLIENT_SECRET   free USPS keys (optional)
     PARCEL_COUNTRY        where parcels are going (default SG)
@@ -94,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.0 (30 Oct 2026)"
+VERSION = "7.1 (30 Oct 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -3095,7 +3097,7 @@ def handle_panel_tap(query, data):
         send_text(stats_text())
         return "Pickups ⬇"
     elif key == "parcels":
-        send_text(parcels_text())
+        send_text(parcels_text(), parcels_markup())
         return "Parcels ⬇"
     elif key == "history":
         send_text(history_text())
@@ -3468,9 +3470,15 @@ def usps_ready():
     return bool(USPS_CLIENT_ID and USPS_CLIENT_SECRET)
 
 
+PARCEL_AUTO = os.getenv("PARCEL_AUTO", "0").strip() == "1"
+SINGPOST_LINK = "https://www.singpost.com/track-items"
+
+
 def live_tracking():
-    """True when at least one tracking service is set up."""
-    return usps_ready() or bool(PARCELS_KEY)
+    """True only when automatic checking is switched on (PARCEL_AUTO=1) and a tracking service is set up.
+    USPS charges for tracking parcels other people sent, and Parcels App doesn't answer from Railway,
+    so by default parcels are tap-to-track buttons."""
+    return PARCEL_AUTO and (usps_ready() or bool(PARCELS_KEY))
 
 
 def usps_link(number):
@@ -3664,12 +3672,28 @@ def looks_like_usps(number):
 
 
 def parcel_markup(number):
+    rows = []
     if usps_ready() or looks_like_usps(number):
-        return {"inline_keyboard": [[
-            {"text": btn("🔎 USPS page"), "url": usps_link(number)},
-            {"text": btn("🌏 Parcels"), "url": track_link(number)},
-        ]]}
-    return {"inline_keyboard": [[{"text": btn("🔎 Track page"), "url": track_link(number)}]]}
+        rows.append([{"text": btn("🔎 USPS page"), "url": usps_link(number)},
+                     {"text": btn("🌏 Parcels"), "url": track_link(number)}])
+    else:
+        rows.append([{"text": btn("🔎 Track page"), "url": track_link(number)}])
+    rows.append([{"text": btn("🇸🇬 SingPost"), "url": SINGPOST_LINK}])
+    return {"inline_keyboard": rows}
+
+
+def parcels_markup():
+    """/parcels: a row of tap-to-track buttons per parcel, and SingPost for the last leg."""
+    rows = []
+    for parcel in [p for p in META.get("parcels") or [] if not p.get("delivered")][-6:]:
+        tail = parcel["number"][-6:]
+        first = ({"text": btn(f"🔎 USPS · {tail}"), "url": usps_link(parcel["number"])}
+                 if looks_like_usps(parcel["number"]) else
+                 {"text": btn(f"🔎 Track · {tail}"), "url": track_link(parcel["number"])})
+        rows.append([first, {"text": btn(f"🌏 Parcels · {tail}"), "url": track_link(parcel["number"])}])
+    if rows:
+        rows.append([{"text": btn("🇸🇬 SingPost (last leg)"), "url": SINGPOST_LINK}])
+    return {"inline_keyboard": rows} if rows else None
 
 
 def parcel_text(parcel, heading="PARCEL UPDATE"):
@@ -3742,13 +3766,16 @@ def parcels_text():
     if not parcels:
         return "\n".join(head + ["Nothing on its way.", "Got a tracking number? Send /track NUMBER"])
     lines = list(head)
+    live = live_tracking()
     for parcel in parcels[-6:]:
         scan = parcel.get("event") or ""
-        lines.append(f"🛹 <b>{esc(parcel['label'])}</b>")
-        lines.append(f"      {parcel_status_line(parcel)}" + (f" · {esc(scan)}" if scan else ""))
-        lines.append(f"      🔢 {esc(parcel['number'])}")
-    if not live_tracking():
-        lines += [LINE, "ℹ️ No live updates yet: add the USPS or Parcels App keys in Railway."]
+        lines.append(f"🛹 <b>{esc(parcel['label'])}</b>" + (" · ✅ delivered" if parcel.get("delivered") else ""))
+        if live:
+            lines.append(f"      {parcel_status_line(parcel)}" + (f" · {esc(scan)}" if scan else ""))
+        lines.append(f"      🔢 <code>{esc(parcel['number'])}</code>")
+    if not live:
+        lines += [LINE, "🔎 Tap a button to see where it is. Tap a number to copy it.",
+                  "💡 For alerts on every scan, add the numbers to a parcel app on your phone."]
     return "\n".join(lines)
 
 
@@ -3800,10 +3827,9 @@ def handle_track(argument):
             first_lookup()
     else:
         send_text(
-            f"📦 <h>Tracking saved</h>\n{LINE}\n🛹 {esc(label)}\n🔢 {esc(number)}\n"
-            "ℹ️ No live updates yet. Add the USPS keys (<b>USPS_CLIENT_ID</b>, <b>USPS_CLIENT_SECRET</b>) "
-            "or a Parcels App key (<b>PARCELS_API_KEY</b>) in Railway and I'll message you on every scan. "
-            "Meanwhile, tap the button.",
+            f"📦 <h>Parcel saved</h>\n{LINE}\n🛹 {esc(label)}\n🔢 <code>{esc(number)}</code>\n"
+            "🔎 Tap a button to see where it is, any time. It's also in /parcels.\n"
+            "💡 For alerts on every scan, add the number to a parcel app on your phone.",
             parcel_markup(number),
         )
 
@@ -3842,7 +3868,7 @@ def maybe_parcel_digest():
 
 def tracking_loop():
     """Runs on its own thread, so a slow tracking service never delays stock checks."""
-    log("Parcel tracking started." + ("" if live_tracking() else " (no tracking keys: links only)"))
+    log("Parcel tracking started." + ("" if live_tracking() else " (tap-to-track buttons only)"))
     last = 0.0
     while True:
         try:
@@ -4416,7 +4442,7 @@ def handle_command(command):
     elif command == "/history":
         send_text(history_text())
     elif command == "/parcels":
-        send_text(parcels_text(), None)
+        send_text(parcels_text(), parcels_markup())
     elif command == "/undo":
         handle_undo()
     elif command == "/info":
