@@ -54,6 +54,7 @@ Railway variables (only the first two are required)
     RADAR_THEME           auto (follows Telegram, default), dark or light
     PUBLIC_URL            the page's https address (Railway fills in RAILWAY_PUBLIC_DOMAIN by itself)
     PORT                  the port the page listens on (Railway sets it, default 8080)
+    PREFER_IPV4           1 = connect over IPv4 first (default; Railway can't reach some sites over IPv6)
   For testing only
     SHOP_URL, STATE_FILE, BARK_SERVER, PARCELS_BASE, USPS_BASE
 
@@ -74,6 +75,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -92,7 +94,23 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "6.7 (28 Oct 2026)"
+VERSION = "6.8 (30 Oct 2026)"
+
+PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
+_GETADDRINFO = socket.getaddrinfo
+
+
+def _ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+    """Railway's network can't reach some sites over IPv6 ("Network is unreachable").
+    Keeping only the IPv4 addresses, when a site has any, avoids that."""
+    results = _GETADDRINFO(host, port, family, type, proto, flags)
+    if not PREFER_IPV4:
+        return results
+    v4 = [r for r in results if r[0] == socket.AF_INET]
+    return v4 or results
+
+
+socket.getaddrinfo = _ipv4_first
 STARTED_AT = time.time()
 
 CHECK_INTERVAL = max(2.0, float(os.getenv("CHECK_INTERVAL", "20")))   # calm mode: easy on the shop
@@ -3307,11 +3325,20 @@ def status_label(status):
     return f"{emoji} {text}"
 
 
+def parcel_status_line(parcel):
+    """What to show for a parcel. If it was never checked because the tracking service can't be
+    reached, say that, instead of pretending it is waiting for a scan."""
+    if not parcel.get("status") and not parcel.get("checked") and TRACK_HEALTH.get("error"):
+        return "⚠️ couldn't check yet: the tracking service can't be reached"
+    return status_label(parcel.get("status"))
+
+
 def track_link(number):
     return f"https://parcelsapp.com/en/tracking/{urllib.parse.quote(number)}"
 
 
-TRACK_HEALTH = {"service": "", "error": "", "told": False}
+TRACK_HEALTH = {"service": "", "error": "", "told": False, "net_fails": 0, "net_told": False}
+NET_FAILS_BEFORE_TELLING = 3
 
 
 def note_tracking_problem(error):
@@ -3321,6 +3348,22 @@ def note_tracking_problem(error):
     code = getattr(error, "code", None)
     TRACK_HEALTH["error"] = f"{service}: {error}"
     log(f"Parcel check failed via {service}: {error}")
+    if code is None:                                   # no answer at all: the network, not the key
+        TRACK_HEALTH["net_fails"] += 1
+        if TRACK_HEALTH["net_fails"] >= NET_FAILS_BEFORE_TELLING and not TRACK_HEALTH["net_told"]:
+            TRACK_HEALTH["net_told"] = True
+            active = [p for p in META.get("parcels") or [] if not p.get("delivered")]
+            rows = []
+            for p in active[:4]:
+                url = usps_link(p["number"]) if looks_like_usps(p["number"]) else track_link(p["number"])
+                rows.append([{"text": btn(f"🔎 {p['label'][:24]} · {p['number'][-4:]}"), "url": url}])
+            send_text(
+                "📦 <h>I can't reach the tracking service</h>\n" + LINE + "\n"
+                f"{esc(service)} isn't answering from Railway ({esc(str(error)[:80])}). I'll keep trying every hour. "
+                "Meanwhile, your parcel's own page works:",
+                {"inline_keyboard": rows} if rows else None,
+            )
+        return
     if code in (401, 402, 403) and not TRACK_HEALTH["told"]:
         TRACK_HEALTH["told"] = True
         if service == "USPS":
@@ -3577,7 +3620,7 @@ def parcel_markup(number):
 
 
 def parcel_text(parcel, heading="PARCEL UPDATE"):
-    lines = [f"📦 <h>{heading}</h>", LINE, f"🛹 {esc(parcel['label'])}", status_label(parcel.get("status"))]
+    lines = [f"📦 <h>{heading}</h>", LINE, f"🛹 {esc(parcel['label'])}", parcel_status_line(parcel)]
     scan = " · ".join(x for x in (parcel.get("event"), parcel.get("where"), fmt_iso(parcel["when"]) if parcel.get("when") else "") if x)
     if scan:
         lines.append(f"📍 {esc(scan)}")
@@ -3617,8 +3660,9 @@ def poll_parcels(only=None):
         except Exception as e:
             note_tracking_problem(e)
             continue
-        TRACK_HEALTH["error"] = ""
-        TRACK_HEALTH["told"] = False
+        TRACK_HEALTH.update(error="", told=False, net_fails=0, net_told=False)
+        with PARCEL_LOCK:
+            parcel["checked"] = time.time()
         if not info:
             continue
         changed = (info["status"], info["event"]) != (parcel.get("status"), parcel.get("event"))
@@ -3648,7 +3692,7 @@ def parcels_text():
     for parcel in parcels[-6:]:
         scan = parcel.get("event") or ""
         lines.append(f"🛹 <b>{esc(parcel['label'])}</b>")
-        lines.append(f"      {status_label(parcel.get('status'))}" + (f" · {esc(scan)}" if scan else ""))
+        lines.append(f"      {parcel_status_line(parcel)}" + (f" · {esc(scan)}" if scan else ""))
         lines.append(f"      🔢 {esc(parcel['number'])}")
     if not live_tracking():
         lines += [LINE, "ℹ️ No live updates yet: add the USPS or Parcels App keys in Railway."]
@@ -3737,7 +3781,7 @@ def maybe_parcel_digest():
     save_meta()
     lines = ["📦 <h>Parcel update</h>", LINE]
     for parcel in active:
-        lines.append(f"🛹 <b>{esc(parcel['label'])}</b> · {status_label(parcel.get('status'))}")
+        lines.append(f"🛹 <b>{esc(parcel['label'])}</b> · {parcel_status_line(parcel)}")
         if parcel.get("event"):
             lines.append(f"      📍 {esc(parcel['event'])}")
     send_text("\n".join(lines))
