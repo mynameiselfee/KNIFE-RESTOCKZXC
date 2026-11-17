@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.3 (17 Nov 2026)"
+VERSION = "7.3.1 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -723,7 +723,17 @@ def locked_page(error):
     final = error.geturl() if hasattr(error, "geturl") else ""
     if urllib.parse.urlparse(final or "").path.rstrip("/") == "/password" or looks_like_password_page(body):
         return body, (final or f"{SITE}/password")
+    if error.code == 401:
+        # Shopify locks a shop with a bare 401 too. Treat it as locked, and log what came back once
+        if not LOCK_NOTE["logged"]:
+            LOCK_NOTE["logged"] = True
+            snippet = re.sub(r"\s+", " ", body[:400].decode("utf-8", "ignore"))
+            log(f"Shop answered 401 at {final or '?'}: {snippet[:300]!r}")
+        return body, f"{SITE}/password"
     return None
+
+
+LOCK_NOTE = {"logged": False}
 
 
 def looks_like_password_page(body):
