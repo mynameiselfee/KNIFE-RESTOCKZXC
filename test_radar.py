@@ -65,6 +65,7 @@ class RadarTests(unittest.TestCase):
         self.original_api = self.r.telegram_api
         self.r.telegram_api = api
         self.world = {"products": shop(False, False, False, False)}
+        self.real_fetch_products = self.r.fetch_products
         self.r.fetch_products = lambda: self.world["products"]
         self.r.META["board"] = False                     # most checks are about the classic one alert per deck
         self.r.META["sizes_v67"] = True                  # most checks use all four sizes
@@ -138,21 +139,70 @@ class RadarTests(unittest.TestCase):
             r.fetch_products_once()
         self.assertIn("DROP FRIDAY", caught.exception.text)
 
-    def test_a_bare_401_reads_as_locked_and_a_403_is_an_error_with_a_true_reason(self):
+    def _opener(self, routes):
         import io, urllib.error
         r = self.r
+        calls = []
+        class Resp:
+            def __init__(self, body, url): self.body, self.url, self.headers = body, url, {}
+            def read(self): return self.body
+            def geturl(self): return self.url
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
         class Opener:
             def open(self, request, timeout=20):
-                raise urllib.error.HTTPError(r.SITE + "/products.json", 401, "Unauthorized", {}, io.BytesIO(b"nope"))
+                url = request.full_url
+                phone = "iPhone" in request.headers.get("User-agent", "")
+                calls.append((url, phone))
+                for (path, want_phone), (code, body) in routes.items():
+                    if urllib.parse.urlparse(url).path == path and (want_phone is None or want_phone == phone):
+                        if code == 200:
+                            return Resp(body, url)
+                        raise urllib.error.HTTPError(url, code, "x", {}, io.BytesIO(body))
+                raise urllib.error.HTTPError(url, 404, "x", {}, io.BytesIO(b""))
+        import urllib.parse
         r.OPENER = Opener()
-        with self.assertRaises(r.ShopLocked):
-            r.fetch_products_once()                       # a bare 401 from the shop also means locked
-        class Opener403:
-            def open(self, request, timeout=20):
-                raise urllib.error.HTTPError(r.SITE + "/products.json", 403, "Forbidden", {}, io.BytesIO(b"nope"))
-        r.OPENER = Opener403()
+        r.fetch_products = self.real_fetch_products
+        return calls
+
+    def test_a_refused_feed_switches_to_another_way_of_reading_the_shop(self):
+        r = self.r
+        good = json.dumps({"products": shop(True, False, False, False)}).encode()
+        self._opener({("/products.json", None): (401, b""), ("/collections/all/products.json", True): (200, good)})
+        products = r.fetch_products()
+        self.assertEqual(products[0]["title"], "Test Deck")
+        self.assertEqual(r.FEED_SOURCE, {"path": "/collections/all/products.json", "browser": True})
+
+    def test_refused_feed_with_an_open_front_page_tells_you_the_shop_is_open(self):
+        r = self.r
+        self._opener({("/products.json", None): (401, b""), ("/collections/all/products.json", None): (401, b""),
+                      ("/", True): (200, b"<html>welcome</html>")})
         with self.assertRaises(r.FetchError) as caught:
-            r.fetch_products_once()
+            r.fetch_products()
+        self.assertNotIsInstance(caught.exception, r.ShopLocked)
+        self.assertIn("open but refuses", str(caught.exception))
+        self.assertIn("The shop looks OPEN", self.sent[-1][1]["text"])
+        self.assertEqual(r.describe_failure(caught.exception), "the shop is open but refusing my stock checks")
+        n = len(self.sent)
+        with self.assertRaises(r.FetchError):
+            r.fetch_products()                            # told once, not every check
+        self.assertEqual(len(self.sent), n)
+
+    def test_refused_feed_with_a_password_front_page_is_locked(self):
+        r = self.r
+        page = b'<form action="/password"><input type="password"></form><p>DROP 8PM</p>'
+        self._opener({("/products.json", None): (401, b""), ("/collections/all/products.json", None): (401, b""),
+                      ("/", True): (401, page)})
+        with self.assertRaises(r.ShopLocked) as caught:
+            r.fetch_products()
+        self.assertIn("DROP 8PM", caught.exception.text)
+
+    def test_a_403_that_is_not_the_password_page_is_an_error_with_a_true_reason(self):
+        r = self.r
+        self._opener({("/products.json", None): (403, b"nope"), ("/collections/all/products.json", None): (403, b""),
+                      ("/", None): (403, b"nope")})
+        with self.assertRaises(r.FetchError) as caught:
+            r.fetch_products()
         self.assertNotIsInstance(caught.exception, r.ShopLocked)
         self.assertIn("refusing my checks (403)", r.describe_failure(caught.exception))
         self.assertEqual(r.describe_failure(Exception("timed out")), "the shop isn't answering")

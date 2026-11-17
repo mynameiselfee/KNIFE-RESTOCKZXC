@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.3.1 (17 Nov 2026)"
+VERSION = "7.4 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -144,6 +144,24 @@ BUTTON_STYLE = os.getenv("BUTTON_STYLE", "").strip().lower()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 "
+                   "(KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"),
+    "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip",
+    "Cache-Control": "no-cache",
+}
+# where the product list is read from; switches by itself if the shop blocks one way
+FEED_SOURCE = {"path": "/products.json", "browser": False}
+FEED_OPTIONS = [
+    ("/products.json", False),
+    ("/products.json", True),
+    ("/collections/all/products.json", True),
+    ("/collections/all/products.json", False),
+]
+GATE = {"t": 0.0, "verdict": "", "told": 0.0}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; KnifeMFG-DeckRadar/2.0)",
@@ -646,6 +664,8 @@ def describe_failure(error):
         if n in ("401", "403"):
             return f"the shop is refusing my checks ({n})"
         return f"the shop answered with an error ({n})"
+    if "open but refuses" in text:
+        return "the shop is open but refusing my stock checks"
     if "empty product list" in text:
         return "the shop sent an empty product list"
     return "the shop isn't answering"
@@ -687,7 +707,7 @@ def fetch_page(url, timeout=20):
     If the shop gave an ETag last time, asks "has it changed?" first. An unchanged page (a 304)
     costs the shop almost nothing, which keeps the radar polite."""
     key = url if "&_=" not in url else None            # a cache-busted address is always new
-    headers = dict(HEADERS)
+    headers = dict(BROWSER_HEADERS if FEED_SOURCE["browser"] else HEADERS)
     cached = CONDITIONAL.get(key) if key else None
     if cached:
         headers["If-None-Match"] = cached[0]
@@ -723,17 +743,7 @@ def locked_page(error):
     final = error.geturl() if hasattr(error, "geturl") else ""
     if urllib.parse.urlparse(final or "").path.rstrip("/") == "/password" or looks_like_password_page(body):
         return body, (final or f"{SITE}/password")
-    if error.code == 401:
-        # Shopify locks a shop with a bare 401 too. Treat it as locked, and log what came back once
-        if not LOCK_NOTE["logged"]:
-            LOCK_NOTE["logged"] = True
-            snippet = re.sub(r"\s+", " ", body[:400].decode("utf-8", "ignore"))
-            log(f"Shop answered 401 at {final or '?'}: {snippet[:300]!r}")
-        return body, f"{SITE}/password"
     return None
-
-
-LOCK_NOTE = {"logged": False}
 
 
 def looks_like_password_page(body):
@@ -829,11 +839,15 @@ def fetch_products_once():
     products = []
     stamp = int(time.time() * 1000)   # makes each request unique so the shop's CDN can't serve an old copy
     for page in range(1, 21):
-        url = f"{SITE}/products.json?limit=250&page={page}" + (f"&_={stamp}" if PACE["buster"] and fast_now() else "")
+        url = f"{SITE}{FEED_SOURCE['path']}?limit=250&page={page}" + (f"&_={stamp}" if PACE["buster"] and fast_now() else "")
         try:
             raw, final_url = fetch_page_retry(url)
         except RateLimited:
             raise
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise Blocked(f"page {page}: HTTP Error {e.code}: {e.reason}", e.code)
+            raise FetchError(f"page {page}: {e}")
         except Exception as e:
             raise FetchError(f"page {page}: {e}")
         if urllib.parse.urlparse(final_url).path.rstrip("/") == "/password":
@@ -853,11 +867,84 @@ def fetch_products_once():
     return products
 
 
+class Blocked(FetchError):
+    """The shop refused the product list (401/403) without showing its password page."""
+
+    def __init__(self, message, code=401):
+        super().__init__(message)
+        self.code = code
+
+
+def homepage_state():
+    """'locked', 'open' or 'unknown', read from the shop's front page like a phone would."""
+    request = urllib.request.Request(SITE + "/", headers=BROWSER_HEADERS)
+    try:
+        with OPENER.open(request, timeout=15) as response:
+            body, final = _read(response), response.geturl()
+    except urllib.error.HTTPError as e:
+        locked = locked_page(e)
+        if locked:
+            return "locked", page_text(locked[0])
+        return ("unknown", f"front page {e.code}")
+    except Exception as e:
+        return "unknown", str(e)[:80]
+    if urllib.parse.urlparse(final).path.rstrip("/") == "/password" or looks_like_password_page(body):
+        return "locked", page_text(body)
+    return "open", ""
+
+
+def get_past_block():
+    """Tries the other ways of reading the product list. Returns products, or raises."""
+    tried = []
+    original = dict(FEED_SOURCE)
+    for path, browser in FEED_OPTIONS:
+        if (path, browser) == (original["path"], original["browser"]):
+            continue
+        FEED_SOURCE.update(path=path, browser=browser)
+        try:
+            products = fetch_products_once()
+        except (Blocked, ShopLocked) as e:
+            tried.append(f"{path}{' (phone)' if browser else ''}: {e}")
+            continue
+        except FetchError as e:
+            tried.append(f"{path}: {e}")
+            continue
+        log(f"Product list now read from {path}" + (" as a phone browser" if browser else ""))
+        return products
+    FEED_SOURCE.update(original)
+    raise Blocked("; ".join(tried)[:300] or "blocked")
+
+
 def fetch_products():
     """Reads the shop. If it is locked and you gave me the password,
-    logs in with it and reads again."""
+    logs in with it and reads again. If the shop refuses the product list,
+    tries the other ways, and checks whether the shop is actually open."""
     try:
         return fetch_products_once()
+    except Blocked as e:
+        first = e
+        if time.time() - GATE["t"] < 45 and GATE["verdict"]:
+            verdict = GATE["verdict"]                      # checked a moment ago: don't hammer the shop
+        else:
+            GATE["t"] = time.time()
+            try:
+                return get_past_block()
+            except Blocked:
+                pass
+            verdict, text = homepage_state()
+            GATE["verdict"] = verdict
+            log(f"Product list refused ({first}). Front page says: {verdict} {text}".strip())
+            if verdict == "locked":
+                GATE["text"] = text
+        if verdict == "locked":
+            PW["using"] = False
+            if try_unlock():
+                return fetch_products_once()
+            raise ShopLocked("shop is behind a password page", GATE.get("text", ""))
+        if verdict == "open":
+            shop_open_but_blocked()
+            raise FetchError("the shop is open but refuses my product checks")
+        raise first
     except ShopLocked:
         PW["using"] = False
         if try_unlock():
@@ -4140,6 +4227,25 @@ def note_locked(text=""):
     send_text("\n".join(lines))
 
 
+def shop_open_but_blocked():
+    """The front page is open to shoppers while the product list refuses the radar: say so loudly,
+    at most every 30 minutes, so a drop is never missed in silence."""
+    global SHOP_LOCKED
+    if time.time() - GATE["told"] < 1800 and not SHOP_LOCKED:
+        return
+    GATE["told"] = time.time()
+    SHOP_LOCKED = False
+    log("The shop is OPEN for shoppers but refuses the radar's product checks.")
+    send_text(
+        "🔓 <h>The shop looks OPEN</h>\n"
+        f"{LINE}\n"
+        "Shoppers can get in, but the shop is refusing my stock checks right now, "
+        "so I can't see which decks are in stock.\n"
+        "⚡ Check it yourself now. I'm still trying every few seconds.",
+        {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]},
+    )
+
+
 def check_stock():
     global CURRENT_SNAPSHOT, LAST_CHECK, SHOP_LOCKED, _last_available, _quiet_checks
 
@@ -4837,6 +4943,8 @@ def main():
             streak_note()
         except Exception as e:
             fails += 1
+            if "open but refuses" in str(e):
+                fails = min(fails, 2)          # keep checking quickly: a drop may be live
             HEALTH["error"] = describe_failure(e)
             log(f"Check failed ({fails} in a row): {e}")
             if fails >= OFFLINE_AFTER and not warned:
