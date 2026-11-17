@@ -280,6 +280,71 @@ class RadarTests(unittest.TestCase):
             r.fetch_products()
         self.assertEqual([urllib.parse.urlparse(u).path for u, _ in calls], ["/"])
 
+    def test_drop_times_on_the_page_are_read_in_us_time(self):
+        r = self.r
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).timestamp()      # Tue 06:00 in Chicago
+        def sg(ts):
+            return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+        self.assertEqual(sg(r.find_drop_time("DROP TONIGHT 8PM · CURRENT CHICAGO TIME", now)), "2026-11-18 02:00")
+        self.assertEqual(sg(r.find_drop_time("Friday 7:30pm ET", now)), "2026-11-21 00:30")
+        self.assertEqual(sg(r.find_drop_time("11/21 6 PM PT", now)), "2026-11-22 02:00")
+        self.assertEqual(sg(r.find_drop_time("Restock 20:00 CST", now)), "2026-11-18 02:00")
+        self.assertEqual(sg(r.find_drop_time("drop at 5am", now)), "2026-11-18 11:00")      # 5am already gone: tomorrow
+        summer = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(sg(r.find_drop_time("8PM CST", summer)), "2026-07-02 01:00")      # summer time: UTC-5
+        self.assertIsNone(r.find_drop_time("32mm KH1 · 34mm KB1 · money back friends", now))
+        self.assertIsNone(r.find_drop_time("Enter password", now))
+        self.assertIsNone(r.find_drop_time("CURRENT CHICAGO TIME 6:01 AM", now))   # the page's clock
+        self.assertIsNone(r.find_drop_time("", now))
+
+    def test_a_drop_time_is_announced_once_and_rings_5_minutes_before(self):
+        r = self.r
+        r.ALARM_ASYNC = False
+        r.BARK_KEY = "k"
+        pushes = []
+        r.bark_push = lambda title, body, url="": pushes.append(title) or "success"
+        r.META["alarm"] = {"on": True, "hours": ""}
+        r.find_drop_time = lambda text, now=None: time.time() + 200
+        self.assertTrue(r.note_drop_time("DROP 8PM"))
+        self.assertIn("Drop time spotted", self.sent[-1][1]["text"])
+        n = len(self.sent)
+        self.assertFalse(r.note_drop_time("DROP 8PM"))                     # same time: not repeated
+        self.assertEqual(len(self.sent), n)
+        r.maybe_drop_countdown()
+        self.assertEqual(pushes, ["Knife Mfg Co: DROP IN 5 MIN"])
+        r.maybe_drop_countdown()
+        self.assertEqual(len(pushes), 1)                                   # rings once
+        self.assertIn("⏰ drop", r.drop_countdown_line())
+
+    def test_wake_ring_only_at_night_when_away_and_not_too_often(self):
+        r = self.r
+        r.ALARM_ASYNC = False
+        r.BARK_KEY = "k"
+        pushes = []
+        r.bark_push = lambda title, body, url="": pushes.append(title) or "success"
+        r.META["alarm"] = {"on": False, "hours": ""}
+        self.assertFalse(r.wake_ring("A", "b"))                            # alarm off
+        r.META["alarm"] = {"on": True, "hours": ""}
+        r.AWAKE["t"] = time.time()
+        self.assertFalse(r.wake_ring("A", "b"))                            # you're awake
+        r.AWAKE["t"] = 0
+        self.assertTrue(r.wake_ring("A", "b"))
+        self.assertFalse(r.wake_ring("B", "b"))                            # not twice in 20 minutes
+        self.assertEqual(pushes, ["A"])
+
+    def test_a_password_found_at_night_rings_bark(self):
+        r = self.r
+        r.ALARM_ASYNC = False
+        r.BARK_KEY = "k"
+        pushes = []
+        r.bark_push = lambda title, body, url="": pushes.append((title, body)) or "success"
+        r.META["alarm"] = {"on": True, "hours": ""}
+        r.try_unlock = lambda quiet=False: True
+        r.note_locked("Password: knives13")
+        self.assertEqual(pushes[0][0], "Knife Mfg Co: PASSWORD")
+        self.assertIn("knives13", pushes[0][1])
+
     def test_gzip_responses_are_read(self):
         class Resp:
             headers = {"Content-Encoding": "gzip"}

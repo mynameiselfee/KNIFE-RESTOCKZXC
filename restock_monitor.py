@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.6 (17 Nov 2026)"
+VERSION = "7.7 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -4086,7 +4086,9 @@ def status_text():
 
     if SHOP_LOCKED:
         hint = "🔑 password saved" if shop_password() else "🔑 got the password? send /password"
-        return "\n".join(head + ["🔒 shop is behind a password", "⚡ watching for it to open", hint])
+        countdown = drop_countdown_line()
+        return "\n".join(head + ["🔒 shop is behind a password", "⚡ watching for it to open", hint]
+                         + ([countdown] if countdown else []))
     if not snapshot and FEED["empty"] and not HEALTH["error"]:
         lines = head + [
             f"🫥 no {' · '.join(my_sizes())} decks listed on the shop right now",
@@ -4219,6 +4221,197 @@ def maybe_daily_ping():
 
 _last_available = None
 _quiet_checks = 0
+WAKE = {"t": 0.0}                 # the last "wake up, something is happening" ring
+
+
+def wake_ring(title, body, url=None):
+    """One Bark ring for a drop sign (password found, shop page changed, shop opened, drop time close).
+    Only at night with the alarm on, never while you're awake, and at most once every 20 minutes.
+    Tapping it marks you awake (so the stock alarm stays quiet) and opens the shop."""
+    if not (BARK_KEY and alarm_active()) or user_awake() or ALARM.get("running"):
+        return False
+    if time.time() - WAKE["t"] < 20 * 60:
+        return False
+    WAKE["t"] = time.time()
+    token = secrets.token_urlsafe(12)
+    ALARM.update(acked=False, token=token, token_t=time.time(), buy=url or SITE)
+    link = awake_link(token) or url or SITE
+
+    def ring():
+        try:
+            reply = bark_push(title, body, link)
+            if bark_problem(reply):
+                log(f"Wake ring failed: {reply}")
+        except Exception as e:
+            log(f"Wake ring failed: {e}")
+    if ALARM_ASYNC:
+        threading.Thread(target=ring, daemon=True).start()
+    else:
+        ring()
+    log(f"Wake ring: {title}")
+    return True
+
+
+# ---------- drop time written on the password page ----------
+US_ZONES = {"E": -5, "C": -6, "M": -7, "P": -8}
+ZONE_WORDS = {
+    "EST": "E", "EDT": "E", "ET": "E", "EASTERN": "E", "NY": "E", "NYC": "E",
+    "CST": "C", "CDT": "C", "CT": "C", "CENTRAL": "C", "CHICAGO": "C",
+    "MST": "M", "MDT": "M", "MT": "M", "MOUNTAIN": "M",
+    "PST": "P", "PDT": "P", "PT": "P", "PACIFIC": "P", "LA": "P",
+}
+DAY_WORDS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+DAY_RE = (r"\b(MONDAY|MON|TUESDAY|TUES|TUE|WEDNESDAY|WED|THURSDAY|THURS|THU|FRIDAY|FRI|"
+          r"SATURDAY|SAT|SUNDAY|SUN)\b")
+MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+DROP_AT = {"t": 0.0, "src": "", "rung": False, "told10": False}
+
+
+def us_offset(zone, utc):
+    """Hours from UTC for a US zone at that moment (summer time from the 2nd Sunday of March
+    to the 1st Sunday of November, 2am local)."""
+    base = US_ZONES[zone]
+    year = utc.year
+
+    def nth_sunday(month, n):
+        d = datetime(year, month, 1)
+        d += timedelta(days=(6 - d.weekday()) % 7)
+        return d + timedelta(weeks=n - 1)
+    start = nth_sunday(3, 2).replace(hour=2) - timedelta(hours=base)          # in UTC
+    end = nth_sunday(11, 1).replace(hour=2) - timedelta(hours=base + 1)
+    naive = utc.replace(tzinfo=None)
+    return base + (1 if start <= naive < end else 0)
+
+
+def find_drop_time(text, now=None):
+    """A drop time written on the page ('DROP FRIDAY 8PM CST', 'tonight 7:30pm ET', '11/21 6 PM PT').
+    Times without a zone are read as Chicago time (the shop shows Chicago time). Returns a UTC
+    timestamp in the future, or None."""
+    if not text:
+        return None
+    up = text.upper()
+    now = time.time() if now is None else now
+    m = re.search(r"(?<![\d:])(\d{1,2})(?::(\d{2}))?\s*(A\.?M\.?|P\.?M\.?)(?![A-Z])"
+                  r"(?:\s*\(?\s*(EST|EDT|ET|CST|CDT|CT|MST|MDT|MT|PST|PDT|PT|EASTERN|CENTRAL|MOUNTAIN|PACIFIC)\b)?", up)
+    if not m:
+        m = re.search(r"(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)()\s*\(?\s*(EST|EDT|ET|CST|CDT|CT|MST|MDT|MT|PST|PDT|PT|"
+                      r"EASTERN|CENTRAL|MOUNTAIN|PACIFIC)\b", up)
+        if not m:
+            return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    ampm = (m.group(3) or "").replace(".", "")
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm.startswith("P") else 0)
+    if hour > 23 or minute > 59:
+        return None
+    zone = ZONE_WORDS.get(m.group(4) or "")
+    if not zone:
+        for word, z in ZONE_WORDS.items():
+            if re.search(rf"\b{word}\b", up) and len(word) > 2:
+                zone = z
+                break
+    zone = zone or "C"
+    utc_now = datetime.fromtimestamp(now, timezone.utc)
+    local_now = utc_now + timedelta(hours=us_offset(zone, utc_now))
+    day = local_now.date()
+    date_hit = re.search(r"\b(\d{1,2})/(\d{1,2})\b", up)
+    month_hit = re.search(r"\b(" + "|".join(MONTHS) + r")[A-Z]*\.?\s+(\d{1,2})(?:ST|ND|RD|TH)?\b", up)
+    day_hit = re.search(DAY_RE, up)
+    explicit = False
+    try:
+        if month_hit:
+            day = day.replace(month=MONTHS.index(month_hit.group(1)) + 1, day=int(month_hit.group(2)))
+            explicit = True
+        elif date_hit:
+            day = day.replace(month=int(date_hit.group(1)), day=int(date_hit.group(2)))
+            explicit = True
+        elif re.search(r"\bTOMORROW\b", up):
+            day = day + timedelta(days=1)
+        elif day_hit:
+            ahead = (DAY_WORDS.index(day_hit.group(1)[:3]) - local_now.weekday()) % 7
+            day = day + timedelta(days=ahead)
+    except ValueError:
+        return None
+    for _ in range(2):
+        local = datetime(day.year, day.month, day.day, hour, minute)
+        guess = local - timedelta(hours=US_ZONES[zone])
+        utc = local - timedelta(hours=us_offset(zone, guess))
+        ts = utc.replace(tzinfo=timezone.utc).timestamp()
+        if abs(ts - now) < 180 and not explicit and not day_hit:
+            return None                      # that's the page's clock showing the time now, not a drop time
+        if ts > now - 300:
+            return ts
+        if explicit:
+            if day.year == local_now.year and (local_now.date() - day).days > 30:
+                day = day.replace(year=day.year + 1)
+                continue
+            return None
+        day = day + timedelta(days=1 if not day_hit else 7)
+    return None
+
+
+def note_drop_time(text):
+    """Remembers a drop time written on the page, tells you once in Singapore time,
+    and lines up fast checks from 10 minutes before."""
+    t = find_drop_time(text)
+    if not t or abs(t - DROP_AT["t"]) < 60:
+        return False
+    if time.time() - DROP_AT.get("told_t", 0) < 600:
+        return False                         # at most one drop-time message every 10 minutes
+    DROP_AT["told_t"] = time.time()
+    DROP_AT.update(t=t, src=text[:200], rung=False, told10=False)
+    META["drop_at"] = t
+    save_meta()
+    if not fast_now():
+        start_drop(80, begin=t - 600)        # a fast window already running is left alone; see maybe_drop_countdown
+    when = local_time(t)
+    send_text(
+        "⏰ <h>Drop time spotted</h>\n"
+        f"{LINE}\n"
+        f"🇸🇬 <b>{when.strftime('%a %d %b · %I:%M %p').replace(' 0', ' ')}</b> Singapore time\n"
+        f"⏳ in {human(t - time.time())}\n"
+        "⚡ Fast checks from 10 minutes before."
+        + ("\n🚨 Bark will ring 5 minutes before." if BARK_KEY and alarm_settings().get("on")
+           and in_alarm_hours(t - 300) else "")
+    )
+    log(f"Drop time on the page: {when.isoformat()} Singapore time")
+    return True
+
+
+def maybe_drop_countdown():
+    """5 minutes before a drop time from the page: one Bark ring (at night) and a heads-up."""
+    t = DROP_AT["t"] or float(META.get("drop_at") or 0)
+    if not t:
+        return
+    DROP_AT["t"] = t
+    left = t - time.time()
+    if left < -3600:
+        DROP_AT["t"] = 0.0
+        META["drop_at"] = 0
+        save_meta()
+        return
+    if 0 < left <= 600 and not fast_now():
+        start_drop(80)                       # fast checks from 10 minutes before, whatever was planned
+    if 0 < left <= 300 and not DROP_AT["rung"]:
+        DROP_AT["rung"] = True
+        send_text(
+            f"⏰ <h>Drop in {human(left)}</h>\n{LINE}\nFast checks are on. Open the shop and get ready.",
+            {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]},
+        )
+        wake_ring("Knife Mfg Co: DROP IN 5 MIN", "The drop starts in about 5 minutes. Tap to open the shop.")
+
+
+def drop_countdown_line():
+    t = DROP_AT["t"] or float(META.get("drop_at") or 0)
+    if not t or t < time.time() - 600:
+        return ""
+    when = local_time(t).strftime("%a %I:%M %p").replace(" 0", " ")
+    left = t - time.time()
+    return f"⏰ drop {when} SG · " + (f"in {human(left)}" if left > 0 else "now")
+
+
 LOCK_TEXT = {"last": ""}
 PAGE_PW = {"tried": []}       # passwords already found on the password page (never announced twice)
 
@@ -4321,6 +4514,7 @@ def use_page_password(text):
             worked = word
             break
     button = {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]}
+    wake_ring("Knife Mfg Co: PASSWORD", f"Password: {(worked or fresh[0])}. Tap to open the shop.")
     if worked:
         save_meta()
         send_text(
@@ -4353,11 +4547,16 @@ def note_locked(text=""):
         use_page_password(text)
     except Exception as e:
         log(f"Reading the password page failed: {e}")
+    try:
+        note_drop_time(text)
+    except Exception as e:
+        log(f"Reading the drop time failed: {e}")
     if SHOP_LOCKED:
         if text and text != LOCK_TEXT["last"]:
             LOCK_TEXT["last"] = text
             start_drop(60)                       # the owner is busy: a drop may be close
             send_text(f"📝 <h>The password page changed:</h>\n{esc(text)}\n⚡ Checking every few seconds now.")
+            wake_ring("Knife Mfg Co: PAGE CHANGED", (text[:150] or "The password page changed.") + " Tap to open the shop.")
         return
     SHOP_LOCKED = True
     LOCK_TEXT["last"] = text
@@ -4380,6 +4579,7 @@ def shop_open_but_blocked():
     GATE["told"] = time.time()
     SHOP_LOCKED = False
     log("The shop is OPEN for shoppers but refuses the radar's product checks.")
+    wake_ring("Knife Mfg Co: SHOP OPEN", "The shop looks open. Tap to check it.")
     send_text(
         "🔓 <h>The shop looks OPEN</h>\n"
         f"{LINE}\n"
@@ -4459,6 +4659,7 @@ def check_stock():
             )
         else:
             log("The shop password is gone: the shop is OPEN")
+            wake_ring("Knife Mfg Co: SHOP OPEN", "The password page is gone. Tap to open the shop.")
             send_text(
                 "🔓 <h>SHOP IS OPEN!</h>\n"
                 f"{LINE}\n"
@@ -5041,7 +5242,7 @@ def main():
         started = time.time()
         refresh_fx()
         check_drop_end()
-        for housekeeping in (maybe_drop_reports, maybe_smart_drop):
+        for housekeeping in (maybe_drop_reports, maybe_smart_drop, maybe_drop_countdown):
             try:
                 housekeeping()
             except Exception as e:
