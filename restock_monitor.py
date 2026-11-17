@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.4.1 (17 Nov 2026)"
+VERSION = "7.5 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -4205,6 +4205,57 @@ def maybe_daily_ping():
 _last_available = None
 _quiet_checks = 0
 LOCK_TEXT = {"last": ""}
+PAGE_PW = {"tried": []}       # passwords already found on the password page (never announced twice)
+
+PAGE_PW_STOP = {
+    "in", "is", "on", "the", "our", "your", "here", "below", "above", "hidden", "coming", "soon",
+    "required", "protected", "needed", "secret", "story", "stories", "video", "live", "instagram",
+    "insta", "ig", "posted", "dropping", "drop", "tba", "tbd", "revealed", "reveal", "announced",
+    "available", "given", "shared", "somewhere", "inside", "at", "on", "will", "be", "for", "to",
+    "page", "store", "shop", "password", "enter", "using", "only", "not", "now", "this", "that",
+    "tomorrow", "today", "tonight", "later", "released", "sent", "emailed", "email", "newsletter",
+    "subscribers", "discord", "tiktok", "youtube", "twitter", "posting", "unlocked", "locked",
+}
+
+
+def find_page_password(text):
+    """A password written on the shop's password page, like "Password: knives" or
+    'the password is "FRIDAY13"'. Returns None when the page only talks about one."""
+    if not text:
+        return None
+    pattern = re.compile(
+        r"\b(?:pass\s?word|passcode|pw)\b\s*(?:is|=|:|-|–|—|→|->|:\s*is)?\s*[\"'“”‘’«]?"
+        r"([A-Za-z0-9][A-Za-z0-9_\-!@#$%&*.]{2,39})[\"'“”‘’»]?",
+        re.I,
+    )
+    for match in pattern.finditer(text):
+        word = match.group(1).rstrip(".!,")
+        if len(word) < 3 or word.lower() in PAGE_PW_STOP:
+            continue
+        return word
+    return None
+
+
+def use_page_password(text):
+    """If the password page shows the password, saves it, tells you (tap to copy) and logs in with it."""
+    word = find_page_password(text)
+    if not word or word in PAGE_PW["tried"]:
+        return False
+    PAGE_PW["tried"].append(word)
+    META["shop_password"] = word
+    META["shop_password_t"] = time.time()
+    save_meta()
+    PW.update(bad=None, last_try=0.0)
+    log(f"Found a password on the shop's password page ({len(word)} characters). Trying it.")
+    send_text(
+        "🔑 <h>Password found on the shop page</h>\n"
+        f"{LINE}\n"
+        f"<code>{esc(word)}</code>  ← tap to copy\n"
+        "Trying it on the shop now. Open the shop and paste it too.",
+        {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]},
+    )
+    try_unlock()
+    return True
 
 
 def note_locked(text=""):
@@ -4212,6 +4263,10 @@ def note_locked(text=""):
     If the owner edits the password page message, tells you again."""
     global SHOP_LOCKED
     text = (text or "").strip()
+    try:
+        use_page_password(text)
+    except Exception as e:
+        log(f"Reading the password page failed: {e}")
     if SHOP_LOCKED:
         if text and text != LOCK_TEXT["last"]:
             LOCK_TEXT["last"] = text

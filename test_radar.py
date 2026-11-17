@@ -220,6 +220,30 @@ class RadarTests(unittest.TestCase):
         self.assertFalse(r.try_unlock())
         self.assertEqual(r.PW["bad"], "wrong")
 
+    def test_a_password_written_on_the_password_page_is_found(self):
+        f = self.r.find_page_password
+        self.assertEqual(f("DROP TONIGHT · Password: knives13"), "knives13")
+        self.assertEqual(f('the password is "FRIDAY"'), "FRIDAY")
+        self.assertEqual(f("pw - Stolly99!"), "Stolly99")
+        self.assertEqual(f("PASSWORD → crows"), "crows")
+        self.assertIsNone(f("DROP TONIGHT 8PM. Password is in our IG story."))
+        self.assertIsNone(f("Password coming soon"))
+        self.assertIsNone(f("This shop will be powered by · Enter password"))
+        self.assertIsNone(f(""))
+
+    def test_a_password_on_the_page_is_shared_and_tried_once(self):
+        r = self.r
+        tried = []
+        r.try_unlock = lambda: tried.append(r.shop_password()) or False
+        r.note_locked("Password: knives13 · drop at 8pm")
+        self.assertEqual(tried, ["knives13"])
+        found = [p for m, p in self.sent if "Password found" in p.get("text", "")]
+        self.assertEqual(len(found), 1)
+        self.assertIn("<code>knives13</code>", found[0]["text"])
+        r.note_locked("Password: knives13 · drop at 8pm")         # same page again: not repeated
+        self.assertEqual(tried, ["knives13"])
+        self.assertEqual(len([p for m, p in self.sent if "Password found" in p.get("text", "")]), 1)
+
     def test_gzip_responses_are_read(self):
         class Resp:
             headers = {"Content-Encoding": "gzip"}
