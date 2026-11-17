@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.4 (17 Nov 2026)"
+VERSION = "7.4.1 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -927,13 +927,15 @@ def fetch_products():
             verdict = GATE["verdict"]                      # checked a moment ago: don't hammer the shop
         else:
             GATE["t"] = time.time()
-            try:
-                return get_past_block()
-            except Blocked:
-                pass
+            if GATE["verdict"] != "locked":            # while locked the other ways are refused too: skip them
+                try:
+                    return get_past_block()
+                except Blocked:
+                    pass
             verdict, text = homepage_state()
+            if verdict != GATE["verdict"]:
+                log(f"Product list refused ({first}). Front page says: {verdict} {text}".strip())
             GATE["verdict"] = verdict
-            log(f"Product list refused ({first}). Front page says: {verdict} {text}".strip())
             if verdict == "locked":
                 GATE["text"] = text
         if verdict == "locked":
