@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restock_monitor.py")
@@ -234,15 +235,50 @@ class RadarTests(unittest.TestCase):
     def test_a_password_on_the_page_is_shared_and_tried_once(self):
         r = self.r
         tried = []
-        r.try_unlock = lambda: tried.append(r.shop_password()) or False
+        r.try_unlock = lambda quiet=False: tried.append(r.shop_password()) or False
         r.note_locked("Password: knives13 · drop at 8pm")
         self.assertEqual(tried, ["knives13"])
-        found = [p for m, p in self.sent if "Password found" in p.get("text", "")]
+        found = [p for m, p in self.sent if "password" in p.get("text", "").lower() and "<code>" in p.get("text", "")]
         self.assertEqual(len(found), 1)
         self.assertIn("<code>knives13</code>", found[0]["text"])
         r.note_locked("Password: knives13 · drop at 8pm")         # same page again: not repeated
         self.assertEqual(tried, ["knives13"])
-        self.assertEqual(len([p for m, p in self.sent if "Password found" in p.get("text", "")]), 1)
+        self.assertTrue(r.fast_now())                              # found something: fast checks
+
+    def test_the_first_password_that_works_is_used_and_shared(self):
+        r = self.r
+        tried = []
+        def unlock(quiet=False):
+            tried.append(r.shop_password())
+            return r.shop_password() == "crows"
+        r.try_unlock = unlock
+        r.GATE["cands"] = ["crows"]
+        r.note_locked("pw: Stolly99")
+        self.assertEqual(tried, ["Stolly99", "crows"])
+        self.assertEqual(r.shop_password(), "crows")
+        msg = [p for m, p in self.sent if "Password found" in p.get("text", "")]
+        self.assertIn("<code>crows</code>", msg[0]["text"])
+        self.assertIn("It works", msg[0]["text"])
+
+    def test_passwords_hidden_in_the_page_code_are_found(self):
+        c = self.r.page_password_candidates
+        self.assertEqual(c(b'<meta name="description" content="Password: hypno77">'), ["hypno77"])
+        self.assertEqual(c(b'<p>The password is <strong>BLOODBATH</strong></p>'), ["BLOODBATH"])
+        self.assertEqual(c(b'<!-- pw: jaymask --><p>Enter password</p>'), ["jaymask"])
+        self.assertEqual(c(b'<img alt="password = tabloid" src="x.png">'), ["tabloid"])
+        self.assertEqual(c(b'<p>Password is in our IG story</p><label>Enter password</label>'), [])
+
+    def test_while_locked_only_the_front_page_is_read_each_check(self):
+        r = self.r
+        page = b'<form action="/password"><input type="password"></form><p>DROP 8PM</p>'
+        calls = self._opener({("/products.json", None): (401, b""), ("/collections/all/products.json", None): (401, b""),
+                              ("/", True): (401, page)})
+        with self.assertRaises(r.ShopLocked):
+            r.fetch_products()
+        calls.clear()
+        with self.assertRaises(r.ShopLocked):
+            r.fetch_products()
+        self.assertEqual([urllib.parse.urlparse(u).path for u, _ in calls], ["/"])
 
     def test_gzip_responses_are_read(self):
         class Resp:

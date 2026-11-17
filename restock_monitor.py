@@ -96,7 +96,7 @@ from datetime import datetime, timedelta, timezone
 SITE = (os.getenv("SHOP_URL", "").strip() or "https://knifemfg.co").rstrip("/")
 SHAPES = ["KH1", "KL2", "KL1", "KB1"]
 
-VERSION = "7.5 (17 Nov 2026)"
+VERSION = "7.6 (17 Nov 2026)"
 
 PREFER_IPV4 = os.getenv("PREFER_IPV4", "1").strip() != "0"
 _GETADDRINFO = socket.getaddrinfo
@@ -851,12 +851,12 @@ def fetch_products_once():
         except Exception as e:
             raise FetchError(f"page {page}: {e}")
         if urllib.parse.urlparse(final_url).path.rstrip("/") == "/password":
-            raise ShopLocked("shop is behind a password page", page_text(raw))
+            raise ShopLocked("shop is behind a password page", lock_text(raw))
         try:
             data = json.loads(raw.decode("utf-8"))
         except Exception as e:
             if looks_like_password_page(raw):
-                raise ShopLocked("shop is behind a password page", page_text(raw))
+                raise ShopLocked("shop is behind a password page", lock_text(raw))
             raise FetchError(f"page {page}: {e}")
         batch = data.get("products", [])
         products.extend(batch)
@@ -884,12 +884,12 @@ def homepage_state():
     except urllib.error.HTTPError as e:
         locked = locked_page(e)
         if locked:
-            return "locked", page_text(locked[0])
+            return "locked", lock_text(locked[0])
         return ("unknown", f"front page {e.code}")
     except Exception as e:
         return "unknown", str(e)[:80]
     if urllib.parse.urlparse(final).path.rstrip("/") == "/password" or looks_like_password_page(body):
-        return "locked", page_text(body)
+        return "locked", lock_text(body)
     return "open", ""
 
 
@@ -919,6 +919,19 @@ def fetch_products():
     """Reads the shop. If it is locked and you gave me the password,
     logs in with it and reads again. If the shop refuses the product list,
     tries the other ways, and checks whether the shop is actually open."""
+    if GATE["verdict"] == "locked":
+        # while locked, the front page alone says locked/open and shows any new message:
+        # one light request per check, fresh every few seconds
+        verdict, text = homepage_state()
+        if verdict == "locked":
+            GATE["text"] = text
+            PW["using"] = False
+            if try_unlock():
+                return fetch_products_once()
+            raise ShopLocked("shop is behind a password page", text)
+        GATE["verdict"] = verdict
+        if verdict == "open":
+            log("The front page is open now.")
     try:
         return fetch_products_once()
     except Blocked as e:
@@ -1035,7 +1048,7 @@ def expire_password():
         send_text("🔑 The saved shop password expired and was removed.\nSend /password again if you still need it.")
 
 
-def try_unlock():
+def try_unlock(quiet=False):
     """Logs in with the password you gave me. Never guesses, and never
     retries a password the shop already rejected."""
     password = shop_password()
@@ -1059,6 +1072,8 @@ def try_unlock():
         return True
     PW.update(bad=password, using=False)
     log("The shop rejected the password.")
+    if quiet:
+        return False
     send_text(
         "❌ <h>The shop rejected that password.</h>\n"
         "Send /password followed by the right one."
@@ -4219,10 +4234,17 @@ PAGE_PW_STOP = {
 
 
 def find_page_password(text):
-    """A password written on the shop's password page, like "Password: knives" or
+    """A password written on the shop's password page, like "Password: knives13" or
     'the password is "FRIDAY13"'. Returns None when the page only talks about one."""
+    found = find_page_passwords(text)
+    return found[0] if found else None
+
+
+def find_page_passwords(text):
+    """Every password-looking word written after "password", "passcode" or "pw", in order."""
     if not text:
-        return None
+        return []
+    out = []
     pattern = re.compile(
         r"\b(?:pass\s?word|passcode|pw)\b\s*(?:is|=|:|-|–|—|→|->|:\s*is)?\s*[\"'“”‘’«]?"
         r"([A-Za-z0-9][A-Za-z0-9_\-!@#$%&*.]{2,39})[\"'“”‘’»]?",
@@ -4230,32 +4252,96 @@ def find_page_password(text):
     )
     for match in pattern.finditer(text):
         word = match.group(1).rstrip(".!,")
-        if len(word) < 3 or word.lower() in PAGE_PW_STOP:
+        if len(word) < 3 or word.lower() in PAGE_PW_STOP or word in out:
             continue
-        return word
-    return None
+        out.append(word)
+    return out
+
+
+def page_password_candidates(raw):
+    """Looks everywhere a shop hides a password in plain sight on its password page:
+    the visible text, the page title and description, picture captions, hidden comments,
+    and a bold/highlighted word right after "password"."""
+    try:
+        doc = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else str(raw or "")
+    except Exception:
+        return []
+    found = []
+
+    def add(words):
+        for w in words:
+            if w not in found:
+                found.append(w)
+
+    add(find_page_passwords(page_text(doc.encode("utf-8", "ignore"))))
+    for bit in re.findall(r'(?is)<title[^>]*>(.*?)</title>', doc):
+        add(find_page_passwords(html.unescape(bit)))
+    for bit in re.findall(r'(?is)<meta[^>]+content\s*=\s*"([^"]{0,400})"', doc):
+        add(find_page_passwords(html.unescape(bit)))
+    for bit in re.findall(r'(?is)\b(?:alt|title|aria-label|placeholder)\s*=\s*"([^"]{0,300})"', doc):
+        add(find_page_passwords(html.unescape(bit)))
+    for bit in re.findall(r'(?s)<!--(.{0,400}?)-->', doc):
+        add(find_page_passwords(bit))
+    for word in re.findall(
+            r'(?is)pass\s?word[^<]{0,60}(?:<[^>]+>\s*){0,3}<(?:strong|b|em|code|mark|u|i|span)\b[^>]*>\s*([^<\s]{3,40})\s*<', doc):
+        word = html.unescape(word).strip(" \"'“”‘’.,!:")
+        if len(word) >= 3 and word.lower() not in PAGE_PW_STOP and re.fullmatch(r"[A-Za-z0-9_\-!@#$%&*.]+", word):
+            add([word])
+    return found[:4]
+
+
+def lock_text(raw):
+    """The readable password-page message; also remembers any password written on it."""
+    try:
+        GATE["cands"] = page_password_candidates(raw)
+    except Exception:
+        GATE["cands"] = []
+    return page_text(raw)
 
 
 def use_page_password(text):
-    """If the password page shows the password, saves it, tells you (tap to copy) and logs in with it."""
-    word = find_page_password(text)
-    if not word or word in PAGE_PW["tried"]:
+    """If the password page shows the password, logs in with it at once (trying up to 4
+    look-alikes, each only once), and sends it to you as tap-to-copy with an Open shop button."""
+    words = find_page_passwords(text)
+    for w in GATE.get("cands") or []:
+        if w not in words:
+            words.append(w)
+    fresh = [w for w in words if w not in PAGE_PW["tried"]][:4]
+    if not fresh:
         return False
-    PAGE_PW["tried"].append(word)
-    META["shop_password"] = word
-    META["shop_password_t"] = time.time()
+    PAGE_PW["tried"].extend(fresh)
+    start_drop(60)                                   # something is happening: check every few seconds
+    log(f"Found {len(fresh)} possible password(s) on the shop's password page. Trying now.")
+    worked = None
+    for word in fresh:
+        META["shop_password"] = word
+        META["shop_password_t"] = time.time()
+        PW.update(bad=None, last_try=0.0)
+        if try_unlock(quiet=True):
+            worked = word
+            break
+    button = {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]}
+    if worked:
+        save_meta()
+        send_text(
+            "🔑 <h>Password found on the shop page</h>\n"
+            f"{LINE}\n"
+            f"<code>{esc(worked)}</code>  ← tap to copy\n"
+            "✅ It works: I'm inside and watching stock. Open the shop and paste it.",
+            button,
+        )
+        return True
+    META["shop_password"] = ""
     save_meta()
-    PW.update(bad=None, last_try=0.0)
-    log(f"Found a password on the shop's password page ({len(word)} characters). Trying it.")
     send_text(
-        "🔑 <h>Password found on the shop page</h>\n"
+        "🔑 <h>The shop page mentions a password</h>\n"
         f"{LINE}\n"
-        f"<code>{esc(word)}</code>  ← tap to copy\n"
-        "Trying it on the shop now. Open the shop and paste it too.",
-        {"inline_keyboard": [[{"text": btn("🛒 Open shop"), "url": SITE}]]},
+        + "\n".join(f"<code>{esc(w)}</code>  ← tap to copy" for w in fresh)
+        + "\nThe shop didn't accept " + ("it" if len(fresh) == 1 else "these") + " from here. "
+        "Try it yourself, or send /password with the right one.",
+        button,
     )
-    try_unlock()
-    return True
+    return False
 
 
 def note_locked(text=""):
@@ -4270,7 +4356,8 @@ def note_locked(text=""):
     if SHOP_LOCKED:
         if text and text != LOCK_TEXT["last"]:
             LOCK_TEXT["last"] = text
-            send_text(f"📝 <h>The password page changed:</h>\n{esc(text)}")
+            start_drop(60)                       # the owner is busy: a drop may be close
+            send_text(f"📝 <h>The password page changed:</h>\n{esc(text)}\n⚡ Checking every few seconds now.")
         return
     SHOP_LOCKED = True
     LOCK_TEXT["last"] = text
